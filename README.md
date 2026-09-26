@@ -6,7 +6,7 @@ Maintune is currently in Preview.
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A self-hosted GitHub repository maintenance console. **v0.1.0-preview.1** receives Issue and Pull Request events through a GitHub App, asks bounded Agents for analysis or code review, and leaves every GitHub write to the Controller and deterministic Policy.
+A self-hosted GitHub repository maintenance console. **v0.1.0-preview.3 candidate** receives Issue and Pull Request events through a GitHub App, asks bounded Agents for analysis or code review, and leaves every GitHub write to the Controller and deterministic Policy.
 
 ## Preview status
 
@@ -57,7 +57,7 @@ Open `http://127.0.0.1:8000` and complete the Setup Wizard. Put an HTTPS reverse
 | Windows 11 installer | Available; final Docker Desktop E2E remains a manual verification item |
 | Linux installer | Available; Ubuntu 24.04 is the acceptance target |
 | Docker Compose | Available; images are built locally |
-| Prebuilt GHCR image | **Not provided in v0.1.0-preview.1** |
+| Prebuilt GHCR image | **Not provided in this Preview candidate** |
 | Plugin system | **Experimental**; interfaces may change |
 
 The installer builds on the user's machine and downloads pinned dependencies from their official package sources. Preview requires network access to GitHub, PyPI, and the configured base-image registry and does not provide a fully offline installation path.
