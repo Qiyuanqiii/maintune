@@ -4,7 +4,7 @@
 
 ## 功能与安装
 
-- Tool：`example.anysearch/search`，接收搜索词和最多 20 条的结果请求，返回可引用的 URL、标题及摘要。
+- Tool：`example.anysearch/search`，接收搜索词和最多 10 条的结果请求，返回可引用的 URL、标题及摘要。
 - 推荐 Agent：`issue_analyzer`、`pr_reviewer`、`ci_analyzer`。**推荐不等于自动启用**；安装后由管理员选择给哪些 Agent 开启。
 - Runtime：仅支持独立进程 `isolated`。Python 依赖文件 `requirements.txt` 不含第三方包；宿主负责提供公开 SDK。
 - 不使用 Hook、Service、Provider 或插件 UI。
@@ -23,7 +23,7 @@ python build_mtp.py
 | --- | --- | --- |
 | `api_key` | AnySearch Bearer key，必填、加密保存、界面遮盖 | 无 |
 | `base_url` | HTTPS API 根地址 | `https://api.anysearch.com` |
-| `max_results` | 单次查询结果上限，1–20 | 10 |
+| `max_results` | 单次查询结果上限，1–10 | 10 |
 | `zone` | `cn` 或 `intl` | `intl` |
 | `language` | 可选结果语言 | 空 |
 
@@ -51,6 +51,6 @@ This independent **Plugin API v2** preview example exposes AnySearch as a Maintu
 
 Build the `.mtp` with `python build_mtp.py`, install `dist/example-anysearch.mtp` through Maintune, configure an API key, enable the plugin, and explicitly enable its Tool for the Agents you choose. The Tool is `example.anysearch/search`; the recommended Agents are `issue_analyzer`, `pr_reviewer`, and `ci_analyzer`. Recommendations do not grant automatic access. The isolated runtime uses an empty standard `requirements.txt`; the host supplies the public SDK.
 
-`api_key` is required, encrypted at rest, and masked in the UI. Optional settings are `base_url` (HTTPS, default `https://api.anysearch.com`), `max_results` (1–20, default 10), `zone` (`cn` or `intl`), and `language`. Each call makes one `POST /v1/search` request with a Bearer header and returns citeable URLs, titles, and snippets. Redirects are refused, and error messages never include the server response body. External search results are untrusted content.
+`api_key` is required, encrypted at rest, and masked in the UI. Optional settings are `base_url` (HTTPS, default `https://api.anysearch.com`), `max_results` (1–10, default 10), `zone` (`cn` or `intl`), and `language`. Each call makes one `POST /v1/search` request with a Bearer header and returns citeable URLs, titles, and snippets. Redirects are refused, and error messages never include the server response body. External search results are untrusted content.
 
 Run offline tests with `python -m unittest discover -s tests -v` after installing the public SDK. From the Maintune source root, `PYTHONPATH=sdk` is sufficient. Tests use mocked HTTP responses and no real credentials. The example follows the Maintune source AGPL-3.0-only license; the SDK has its own MIT license. AnySearch's API service and marks remain with their respective owners.

@@ -52,10 +52,10 @@ def _endpoint(base_url: str) -> str:
 
 
 def _max_results(requested: int, configured: Any) -> int:
-    if type(requested) is not int or not 1 <= requested <= 20:
-        raise AnySearchError("max_results must be between 1 and 20")
-    if type(configured) is not int or not 1 <= configured <= 20:
-        raise AnySearchError("Configured max_results must be between 1 and 20")
+    if type(requested) is not int or not 1 <= requested <= 10:
+        raise AnySearchError("max_results must be between 1 and 10")
+    if type(configured) is not int or not 1 <= configured <= 10:
+        raise AnySearchError("Configured max_results must be between 1 and 10")
     return min(requested, configured)
 
 
@@ -165,7 +165,7 @@ def register(api: PluginAPI) -> None:
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 500},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 10},
             },
             "required": ["query"],
             "additionalProperties": False,

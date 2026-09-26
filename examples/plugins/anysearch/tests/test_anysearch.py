@@ -67,7 +67,7 @@ class AnySearchTests(unittest.TestCase):
         self.assertEqual((tool["kind"], tool["name"]), ("tool", "search"))
         self.assertEqual(tool["recommended_agents"], ["issue_analyzer", "pr_reviewer", "ci_analyzer"])
         self.assertEqual(tool["input_schema"]["required"], ["query"])
-        self.assertEqual(tool["input_schema"]["properties"]["max_results"]["maximum"], 20)
+        self.assertEqual(tool["input_schema"]["properties"]["max_results"]["maximum"], 10)
 
     def test_search_post_bearer_and_result_mapping_without_network(self):
         opener = FakeOpener({
@@ -98,6 +98,12 @@ class AnySearchTests(unittest.TestCase):
             for base_url in ("http://example.com", "https://user:pass@example.com", "https://example.com/?q=x"):
                 with self.assertRaises(plugin.AnySearchError):
                     asyncio.run(plugin.search(self.context(base_url=base_url), "topic"))
+            builder.assert_not_called()
+
+    def test_remote_api_limit_is_enforced_before_http(self):
+        with patch.object(plugin.urllib.request, "build_opener") as builder:
+            with self.assertRaisesRegex(plugin.AnySearchError, "between 1 and 10"):
+                asyncio.run(plugin.search(self.context(), "topic", 11))
             builder.assert_not_called()
 
     def test_redirect_handler_never_reuses_authorization(self):
