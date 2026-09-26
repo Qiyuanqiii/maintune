@@ -27,7 +27,7 @@ Repository = "https://github.com/mcxianyujun/maintune"
 dev = ["pytest>=8,<10"]
 
 [tool.setuptools.packages.find]
-where = ["backend"]
+where = ["backend", "sdk"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

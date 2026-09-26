@@ -1,4 +1,13 @@
-# Maintune Plugin API v1
+# Maintune Plugin API v1 (Legacy)
+
+**Status:** Legacy, supported for existing plugins. No removal date has been
+announced. New plugins should target [Plugin API v2](plugin-api-v2.md). The
+Preview 2 `official.astrbot-bridge` release package remains a compatibility
+fixture: tests install that original `.mtp`, start it, exchange a real status
+RPC with its child process, disable it, and reload it without repackaging.
+
+The `api_version: 1` manifest field and `maintune.plugin.v1` event protocol
+remain v1 contracts. A v1 package is not silently rewritten as a v2 package.
 
 Plugin API v1 is Maintune's first public, out-of-process extension boundary. It
 is Experimental during the Preview series, but its protocol is explicitly
