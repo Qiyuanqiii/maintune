@@ -16,6 +16,8 @@ A self-hosted GitHub repository maintenance console. **v0.1.0-preview.3 candidat
 - OpenAI-compatible models, OpenHands SDK Runtime, and Local or Shipyard Neo Sandbox.
 - Bilingual `zh-CN` / `en-US` WebUI, Setup Wizard, evidence timeline, usage, diagnostics, and backup workflows.
 - Windows 11, Ubuntu 24.04, and Docker Compose local-build deployment paths.
+- Experimental Plugin API v1 with validated `.mtp` packages, out-of-process lifecycle, capability enforcement, encrypted plugin secrets, and a safe README viewer.
+- Official preview bridges: [Maintune AstrBot Bridge](https://github.com/mcxianyujun/maintune-plugin-astrbot) and [AstrBot Maintune Bridge](https://github.com/mcxianyujun/astrbot-plugin-maintune).
 
 This Preview is intended for maintainers and small teams who can self-host and review automation policy. It does not promise unattended operation, universal automatic fixes, or a stable plugin API.
 

@@ -13,6 +13,8 @@
 - OpenAI-compatible 模型、OpenHands SDK Runtime、Local 与 Shipyard Neo Sandbox。
 - Setup Wizard、任务时间线、用量、失败原因、备份与诊断。
 - Windows 11、Ubuntu 24.04 和 Docker Compose 本地构建部署。
+- Experimental Plugin API v1：`.mtp` 本地插件包、进程外生命周期、capability 权限、加密插件 Secret 与安全 README 查看器。
+- 官方 Preview 桥接插件：[Maintune AstrBot Bridge](https://github.com/mcxianyujun/maintune-plugin-astrbot) 与 [AstrBot Maintune Bridge](https://github.com/mcxianyujun/astrbot-plugin-maintune)。
 
 适合愿意自己部署、能审阅自动化策略，并希望试用 Issue → PR → Review → Merge 闭环的个人维护者和小团队。它仍是 Preview，不承诺无人值守运行、所有仓库都能自动修复，或插件 API 已稳定。
 
