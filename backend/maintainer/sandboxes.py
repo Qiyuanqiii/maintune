@@ -17,6 +17,46 @@ class SandboxProvider(Protocol):
     async def destroy(self, sandbox: str) -> None: ...
 
 
+class PluginSandbox:
+    """Sandbox operations are mediated by the Plugin API, never plugin internals."""
+
+    def __init__(self, manager, identifier: str):
+        self.manager, self.identifier = manager, identifier
+
+    async def _call(self, action: str, **arguments):
+        return await self.manager.invoke_provider(self.identifier, "sandbox", {"action": action, **arguments})
+
+    async def create(self, task_id: str, ttl: int = 3600) -> str:
+        if not 60 <= ttl <= 86400:
+            raise ValueError("Invalid sandbox TTL")
+        result = await self._call("create", task_id=task_id, ttl=ttl)
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str) or not result["id"]:
+            raise ValueError("Plugin sandbox returned an invalid ID")
+        return result["id"]
+
+    async def read_file(self, sandbox: str, path: str) -> str:
+        result = await self._call("read_file", sandbox=sandbox, path=ShipyardSandbox.safe_path(path))
+        if not isinstance(result, dict) or not isinstance(result.get("content"), str) or len(result["content"].encode()) > 1_000_000:
+            raise ValueError("Plugin sandbox returned invalid file content")
+        return result["content"]
+
+    async def write_file(self, sandbox: str, path: str, content: str) -> None:
+        if len(content.encode()) > 1_000_000:
+            raise ValueError("File too large")
+        await self._call("write_file", sandbox=sandbox, path=ShipyardSandbox.safe_path(path), content=content)
+
+    async def exec(self, sandbox: str, command: str, timeout: int, cwd: str = ".") -> dict:
+        if not 1 <= timeout <= 7200 or not command or len(command) > 4000:
+            raise ValueError("Invalid command or timeout")
+        result = await self._call("exec", sandbox=sandbox, command=command, timeout=timeout, cwd=ShipyardSandbox.safe_path(cwd))
+        if not isinstance(result, dict) or not isinstance(result.get("exit_code"), int) or not isinstance(result.get("output"), str):
+            raise ValueError("Plugin sandbox returned an invalid execution result")
+        return {"exit_code": result["exit_code"], "output": result["output"][:100_000], "truncated": bool(result.get("truncated") or len(result["output"]) > 100_000)}
+
+    async def destroy(self, sandbox: str) -> None:
+        await self._call("destroy", sandbox=sandbox)
+
+
 class LocalSandbox:
     """File-only default. A cwd restriction cannot safely confine arbitrary shell."""
     def __init__(self, root: str):

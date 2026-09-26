@@ -1,3 +1,4 @@
+import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -109,8 +110,9 @@ class ModelDefinition(StrictModel):
 
 class ProviderInput(StrictModel):
     name: str = Field(min_length=1, max_length=80)
-    type: Literal["openai-compatible"] = "openai-compatible"
-    base_url: str
+    type: Literal["openai-compatible", "plugin"] = "openai-compatible"
+    base_url: str = ""
+    plugin_provider: str | None = None
     api_key: SecretStr | None = None
     models: list[ModelDefinition] = Field(default_factory=list, max_length=100)
 
@@ -125,12 +127,22 @@ class ProviderInput(StrictModel):
     @field_validator("base_url")
     @classmethod
     def valid_url(cls, value: str) -> str:
+        if not value:
+            return value
         u = urlsplit(value)
         if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.query or u.fragment:
             raise ValueError("Use an HTTP(S) URL without credentials, query or fragment")
         if u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("Remote model providers require HTTPS")
         return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def valid_provider_type(self):
+        if self.type == "openai-compatible" and (not self.base_url or self.plugin_provider):
+            raise ValueError("OpenAI-compatible providers require a Base URL and no plugin identifier")
+        if self.type == "plugin" and (self.base_url or not self.plugin_provider):
+            raise ValueError("Plugin providers require a plugin identifier and no Base URL")
+        return self
 
     @field_validator("models")
     @classmethod
@@ -213,10 +225,17 @@ class GeneralSettings(StrictModel):
 
 
 class SandboxSettings(StrictModel):
-    provider: Literal["local", "shipyard"] = "local"
+    provider: str = Field(default="local", min_length=1, max_length=200)
     base_url: str = "http://127.0.0.1:8123"
     api_key: SecretStr | None = None
     profile: str = Field(default="python-default", min_length=1, max_length=100)
+
+    @field_validator("provider")
+    @classmethod
+    def valid_provider(cls, value: str) -> str:
+        if value in {"local", "shipyard"} or re.fullmatch(r"[a-z0-9][a-z0-9.-]{2,127}/[a-z][a-z0-9_.-]{0,63}", value):
+            return value
+        raise ValueError("Invalid Sandbox provider identifier")
 
     @field_validator("base_url")
     @classmethod

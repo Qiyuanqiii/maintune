@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import time
@@ -65,7 +66,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for action in db.scalars(select(Outbox).where(Outbox.status == "executing")):
                 action.status = "unknown"
                 action.error = "Service restarted while external action was executing; reconciliation required"
-        app.state.processor = TaskProcessor(sessions, vault, settings, event_sink=app.state.plugins.publish_task)
+        app.state.processor = TaskProcessor(sessions, vault, settings, event_sink=app.state.plugins.publish_task, plugins=app.state.plugins)
+        app.state.plugins.controller = app.state.processor
         await app.state.plugins.start()
         app.state.worker_stop = asyncio.Event()
         app.state.worker = asyncio.create_task(worker_loop(app))
@@ -106,6 +108,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        if request.url.path.startswith("/api/plugins/") and "/ui/" in request.url.path:
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'none'"
         if request.url.path.startswith("/api"):
             response.headers["Cache-Control"] = "no-store"
         elif request.url.path == "/":
@@ -131,6 +136,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def validate_ref(db, ref: ModelRef | None):
         if ref is not None:
             provider = get(db, Provider, ref.provider)
+            if provider.data.get("type") == "plugin" and not any(item.identifier == provider.data.get("plugin_provider") for item in plugin_manager.registry.list("provider")):
+                raise HTTPException(409, "Plugin Model Provider is not running")
             definition = next((item for item in provider_config(provider).models if item.id == ref.model), None)
             if not definition or not definition.enabled:
                 raise HTTPException(422, "Model is not configured on provider")
@@ -156,7 +163,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             validate_runtime_capabilities(definition, agent.runtime.reasoning, agent.runtime.generation)
 
     def provider_view(p):
-        return {"id": p.id, **provider_config(p).model_dump(), "api_key_masked": "••••••••" if p.encrypted_key else "", "has_key": bool(p.encrypted_key)}
+        data = provider_config(p).model_dump()
+        available = data.get("type") != "plugin" or any(item.identifier == data.get("plugin_provider") for item in plugin_manager.registry.list("provider"))
+        return {"id": p.id, **data, "available": available, "api_key_masked": "••••••••" if p.encrypted_key else "", "has_key": bool(p.encrypted_key)}
 
     def audit_reset(db, object_type: str, object_id: str, scope: str):
         db.add(ConfigAudit(kind="config_reset", data={"object_type": object_type, "object_id": object_id, "reset_scope": scope}))
@@ -214,7 +223,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         storage_ready = workspace.exists() and os.access(workspace, os.W_OK)
         with sessions() as db:
             general = GeneralSettings.model_validate(get(db, Config, "general").data)
-            providers_ready = bool(general.model and db.get(Provider, general.model.provider) and db.get(Provider, general.model.provider).encrypted_key)
+            selected_provider = db.get(Provider, general.model.provider) if general.model else None
+            providers_ready = bool(selected_provider and (
+                selected_provider.encrypted_key if selected_provider.data.get("type") != "plugin"
+                else any(item.identifier == selected_provider.data.get("plugin_provider") for item in plugin_manager.registry.list("provider"))
+            ))
             github = db.get(Config, "github")
             sandbox_data = get(db, Config, "sandbox").data
             sandbox = SandboxSettings.model_validate({key: value for key, value in sandbox_data.items() if key != "encrypted_key"})
@@ -225,7 +238,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "system": storage_ready,
             "model": providers_ready,
             "github": bool(github and github.data.get("app_id") and github.data.get("private_key") and github.data.get("webhook_secret")),
-            "sandbox": sandbox.provider == "local" or bool(sandbox.base_url and get_saved_sandbox_key()),
+            "sandbox": sandbox.provider == "local" or (
+                bool(sandbox.base_url and get_saved_sandbox_key()) if sandbox.provider == "shipyard"
+                else any(item.identifier == sandbox.provider and item.metadata.get("provider_kind") == "sandbox" for item in plugin_manager.registry.list("provider"))
+            ),
             "repository": repository_count > 0,
             "optional_services": True,
             "diagnostics": bool(checks) and all(item.get("ok") for item in checks.values()),
@@ -241,15 +257,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             data = get(db, Config, "sandbox").data
         if data["provider"] == "shipyard":
             return await ShipyardConnection().test(data["base_url"], vault.decrypt(data.get("encrypted_key")))
-        local = LocalSandbox(settings.workspace_root)
-        sandbox_id = await local.create(uid())
+        provider = LocalSandbox(settings.workspace_root) if data["provider"] == "local" else app.state.processor.sandbox()
+        sandbox_id = await provider.create(uid())
         try:
-            await local.write_file(sandbox_id, "probe.txt", "maintainer-probe")
-            if await local.read_file(sandbox_id, "probe.txt") != "maintainer-probe":
+            await provider.write_file(sandbox_id, "probe.txt", "maintainer-probe")
+            if await provider.read_file(sandbox_id, "probe.txt") != "maintainer-probe":
                 raise ValueError("Readback mismatch")
         finally:
-            await local.destroy(sandbox_id)
-        return {"ok": True, "capability": "isolated file workspace; shell disabled"}
+            await provider.destroy(sandbox_id)
+        return {"ok": True, "capability": "Sandbox create/write/read/destroy"}
 
     @api.get("/github")
     def github_settings():
@@ -418,6 +434,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (PluginError, PluginPackageError) as error:
             raise HTTPException(422, str(error)) from error
 
+    @api.post("/plugins/upgrade/{filename}")
+    async def plugin_upgrade(filename: str):
+        try:
+            return await plugin_manager.upgrade(filename)
+        except (PluginError, PluginPackageError) as error:
+            raise HTTPException(422, str(error)) from error
+
     @api.post("/plugins/{plugin_id}/enable")
     async def plugin_enable(plugin_id: str):
         try:
@@ -439,6 +462,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (PluginError, PluginPackageError) as error:
             raise HTTPException(422, str(error)) from error
 
+    @api.put("/plugins/{plugin_id}/runtime")
+    def plugin_runtime(plugin_id: str, body: dict[str, str]):
+        try:
+            return plugin_manager.set_runtime_mode(plugin_id, body.get("mode", ""))
+        except (PluginError, PluginPackageError) as error:
+            raise HTTPException(422, str(error)) from error
+
+    @api.post("/plugins/{plugin_id}/tools/enable-recommended")
+    def plugin_enable_recommended_tools(plugin_id: str):
+        try:
+            return {"enabled": plugin_manager.enable_recommended_tools(plugin_id)}
+        except (PluginError, PluginPackageError) as error:
+            raise HTTPException(422, str(error)) from error
+
+    @api.get("/plugins/tools/{agent_id}")
+    def plugin_agent_tools(agent_id: str):
+        return {"tools": [item.identifier for item in plugin_manager.agent_tools(agent_id)]}
+
+    @api.put("/plugins/tools/{agent_id}")
+    def plugin_set_agent_tools(agent_id: str, body: dict[str, list[str]]):
+        try:
+            return {"tools": plugin_manager.set_agent_tools(agent_id, body.get("tools", []))}
+        except (PluginError, PluginPackageError) as error:
+            raise HTTPException(422, str(error)) from error
+
     @api.get("/plugins/{plugin_id}/readme")
     def plugin_readme(plugin_id: str):
         try:
@@ -447,9 +495,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, str(error)) from error
 
     @api.delete("/plugins/{plugin_id}", status_code=204)
-    async def plugin_uninstall(plugin_id: str):
+    async def plugin_uninstall(plugin_id: str, delete_data: bool = False):
         try:
-            await plugin_manager.uninstall(plugin_id)
+            await plugin_manager.uninstall(plugin_id, delete_data=delete_data)
         except (PluginError, PluginPackageError) as error:
             raise HTTPException(422, str(error)) from error
 
@@ -466,6 +514,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"value": plugin_manager.regenerate_secret(plugin_id, field_name)}
         except (PluginError, PluginPackageError) as error:
             raise HTTPException(422, str(error)) from error
+
+    @api.post("/plugins/{plugin_id}/ui-session")
+    def plugin_ui_session(plugin_id: str, request: Request):
+        try:
+            token = plugin_manager.issue_ui_session(plugin_id)
+        except (PluginError, PluginPackageError) as error:
+            raise HTTPException(404, "Plugin UI is not available") from error
+        response = JSONResponse({"url": f"/api/plugins/{plugin_id}/ui/{plugin_manager.view(plugin_id)['ui_entrypoint']}"})
+        response.set_cookie("maintune_plugin_ui", token, max_age=300, path=f"/api/plugins/{plugin_id}/", httponly=True, secure=request.url.scheme == "https", samesite="strict")
+        return response
+
+    async def plugin_http_response(request: Request, plugin_id: str, name: str, access: str):
+        raw = await request.body()
+        if len(raw) > MAX_MESSAGE_BYTES // 2:
+            raise HTTPException(413, "Plugin request body is too large")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        parsed = None
+        if content_type == "application/json" and raw:
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, UnicodeDecodeError) as error:
+                raise HTTPException(400, "Invalid plugin JSON body") from error
+        forwarded = {key: request.headers[key] for key in ("content-type", "x-request-id", "x-hub-signature-256") if key in request.headers}
+        if access == "external" and "authorization" in request.headers:
+            supplied = request.headers["authorization"]
+            admin = "Bearer " + settings.admin_token.get_secret_value()
+            if supplied == admin:
+                raise HTTPException(400, "Maintune administrator token cannot be used on an external plugin route")
+            forwarded["authorization"] = supplied
+        try:
+            result = await plugin_manager.invoke_route(plugin_id, name, request.method, access, {"json": parsed, "raw_base64": base64.b64encode(raw).decode("ascii")}, forwarded)
+        except PluginError as error:
+            raise HTTPException(503, "Plugin route unavailable") from error
+        if isinstance(result, dict) and "status_code" in result and "body" in result:
+            code = result["status_code"]
+            if not isinstance(code, int) or not 200 <= code <= 599:
+                raise HTTPException(502, "Plugin returned an invalid status code")
+            return JSONResponse(result["body"], status_code=code)
+        return JSONResponse(result)
+
+    @api.api_route("/plugins/{plugin_id}/http/{name}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def plugin_authenticated_http(request: Request, plugin_id: str, name: str):
+        return await plugin_http_response(request, plugin_id, name, "authenticated")
+
+    @app.api_route("/api/plugins/{plugin_id}/public/{name}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def plugin_external_http(request: Request, plugin_id: str, name: str):
+        return await plugin_http_response(request, plugin_id, name, "external")
+
+    @app.get("/api/plugins/{plugin_id}/ui/{asset_path:path}")
+    def plugin_ui_asset(request: Request, plugin_id: str, asset_path: str):
+        if not plugin_manager.valid_ui_session(plugin_id, request.cookies.get("maintune_plugin_ui", "")):
+            raise HTTPException(401, "Plugin UI session required")
+        try:
+            return FileResponse(plugin_manager.ui_file(plugin_id, asset_path))
+        except PluginPackageError as error:
+            raise HTTPException(404, "Plugin UI asset is not available") from error
+
+    @app.api_route("/api/plugins/{plugin_id}/ui-api/{name}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def plugin_ui_http(request: Request, plugin_id: str, name: str):
+        if not plugin_manager.valid_ui_session(plugin_id, request.cookies.get("maintune_plugin_ui", "")):
+            raise HTTPException(401, "Plugin UI session required")
+        return await plugin_http_response(request, plugin_id, name, "authenticated")
 
     @api.post("/tasks/{task_id}/retry")
     def retry_task(task_id: str):
@@ -502,6 +612,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/providers", status_code=201)
     def add_provider(body: ProviderInput):
+        if body.type != "openai-compatible":
+            raise HTTPException(409, "Plugin Model Providers are managed by their installed plugin")
         with sessions.begin() as db:
             p = Provider(data=body.model_dump(exclude={"api_key"}), encrypted_key=vault.encrypt(body.api_key.get_secret_value()) if body.api_key and body.api_key.get_secret_value() else None)
             db.add(p)
@@ -512,6 +624,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def edit_provider(identifier: str, body: ProviderInput):
         with sessions.begin() as db:
             p = get(db, Provider, identifier)
+            if p.data.get("type") == "plugin" or body.type != "openai-compatible":
+                raise HTTPException(409, "Plugin Model Providers are managed by their installed plugin")
             general = GeneralSettings.model_validate(get(db, Config, "general").data)
             agent_configs = [AgentInput.model_validate(a.data) for a in db.scalars(select(Agent))]
             refs = [general.model] + [a.model for a in agent_configs]
@@ -532,6 +646,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_provider(identifier: str):
         with sessions.begin() as db:
             p = get(db, Provider, identifier)
+            if p.data.get("type") == "plugin":
+                raise HTTPException(409, "Disable or uninstall the plugin to remove its Model Provider")
             refs = [get(db, Config, "general").data.get("model")] + [a.data.get("model") for a in db.scalars(select(Agent))]
             if any(r and r["provider"] == identifier for r in refs):
                 raise HTTPException(409, "Provider is still referenced by an agent")
@@ -541,9 +657,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def test_provider(identifier: str):
         with sessions() as db:
             p = get(db, Provider, identifier)
-            provider = app.state.provider_factory(p.data["base_url"], vault.decrypt(p.encrypted_key))
+            data = provider_config(p)
         try:
             async with asyncio.timeout(20):
+                if data.type == "plugin":
+                    model = next((item.id for item in data.models if item.enabled), None)
+                    if not model:
+                        raise ValueError("No enabled plugin model")
+                    base_url, key, _ = await plugin_manager.resolve_model_endpoint(data.plugin_provider, model)
+                    provider = app.state.provider_factory(base_url, key)
+                else:
+                    provider = app.state.provider_factory(data.base_url, vault.decrypt(p.encrypted_key))
                 return {"ok": True, "models": await provider.models()}
         except Exception:
             raise HTTPException(502, "Model listing failed; check endpoint, key and provider compatibility") from None
@@ -552,6 +676,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def reset_provider_model(identifier: str, model_id: str, body: ResetInput):
         with sessions.begin() as db:
             row = get(db, Provider, identifier)
+            if row.data.get("type") == "plugin":
+                raise HTTPException(409, "Plugin Model Provider definitions are managed by their installed plugin")
             provider = provider_config(row)
             index = next((index for index, model in enumerate(provider.models) if model.id == model_id), None)
             if index is None:
@@ -668,6 +794,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.put("/sandbox")
     def write_sandbox(body: SandboxSettings):
+        if body.provider not in {"local", "shipyard"}:
+            try:
+                registration = plugin_manager.registry.get(body.provider, "provider")
+            except Exception:
+                raise HTTPException(409, "Selected Sandbox plugin is unavailable") from None
+            if registration.metadata.get("provider_kind") != "sandbox":
+                raise HTTPException(409, "Selected plugin is not a Sandbox provider")
         with sessions.begin() as db:
             row = get(db, Config, "sandbox")
             encrypted = row.data.get("encrypted_key")
@@ -691,14 +824,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 resolved = resolve_agent_config(db, body.agent)
             except ValueError as error:
                 raise HTTPException(409, str(error)) from None
-            p = get(db, Provider, resolved.provider)
-            key = vault.decrypt(p.encrypted_key)
-            provider = app.state.provider_factory(resolved.base_url, key)
             record = Run(data={"trigger": "manual_diagnostic", "agent": body.agent, "model": resolved.model, "provider": resolved.provider, "repository": None, "number": None, "tool_calls": [], "github_actions": [], "sandbox": None, "runtime_config": resolved.audit_snapshot()})
             db.add(record)
             db.flush()
             run_id = record.id
         try:
+            resolved, key = await app.state.processor.model_endpoint(body.agent)
+            provider = app.state.provider_factory(resolved.base_url, key)
             completion = await agent_task(app.state.runtime.run(provider, resolved.model, resolved.system_prompt, body.prompt, resolved.model_timeout, openai_compatible_parameters(resolved)), resolved.task_timeout)
             # A provider might echo its own credential. Never persist that plaintext.
             result = completion.text.replace(key, "[REDACTED]") if key else completion.text
