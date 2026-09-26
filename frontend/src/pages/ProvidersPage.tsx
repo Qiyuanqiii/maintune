@@ -21,10 +21,10 @@ export function ProvidersPage({ c }: { c: ConsoleState }) {
             <section key={p.id}>
               <div className="section-head">
                 <div className="provider-icon"><NavMascotIcon kind="models"/></div>
-                <span className="badge">OpenAI-compatible</span>
+                <span className="badge">{p.type === "plugin" ? t("providers.pluginBadge") : "OpenAI-compatible"}</span>
               </div>
               <h2>{p.name}</h2>
-              <p className="muted break">{p.base_url}</p>
+              <p className="muted break">{p.type === "plugin" ? p.plugin_provider : p.base_url}</p>
               <p>
                 {p.models.map((m) => (
                   <span className="model-tag" key={m.id}>
@@ -32,9 +32,9 @@ export function ProvidersPage({ c }: { c: ConsoleState }) {
                   </span>
                 ))}
               </p>
-              <p className="muted">API Key {p.api_key_masked || t("providers.keyUnset")}</p>
+              {p.type === "plugin" ? <p className="muted">{t("providers.pluginManaged")}</p> : <p className="muted">API Key {p.api_key_masked || t("providers.keyUnset")}</p>}
               <div className="actions">
-                <button onClick={() => editProvider(p)}>{t("common.edit")}</button>
+                {p.type !== "plugin" && <button onClick={() => editProvider(p)}>{t("common.edit")}</button>}
                 <button
                   disabled={busy}
                   onClick={() =>
@@ -51,7 +51,7 @@ export function ProvidersPage({ c }: { c: ConsoleState }) {
                 >
                   {t("integration.testConnection")}
                 </button>
-                <button
+                {p.type !== "plugin" && <button
                   className="danger text"
                   onClick={() => {
                     if (confirm(t("providers.deleteConfirm")))
@@ -62,7 +62,7 @@ export function ProvidersPage({ c }: { c: ConsoleState }) {
                   }}
                 >
                   {t("providers.delete")}
-                </button>
+                </button>}
               </div>
             </section>
           ))}

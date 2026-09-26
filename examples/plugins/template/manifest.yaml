@@ -1,0 +1,18 @@
+{
+  "id": "yourname.hello-plugin",
+  "name": "Hello Plugin",
+  "version": "0.1.0",
+  "plugin_api": 2,
+  "publisher": "yourname",
+  "license": "MIT",
+  "description": "A minimal Maintune Plugin API v2 template.",
+  "maintune": { "min_version": "0.1.0" },
+  "runtime": { "default": "isolated", "supported": ["isolated"] },
+  "entrypoint": { "python": "main" },
+  "python": { "dependencies": "requirements.txt" },
+  "config_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}

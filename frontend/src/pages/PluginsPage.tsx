@@ -14,17 +14,22 @@ export function PluginsPage({ c }: { c: ConsoleState }) {
   const [revealed, setRevealed] = useState<Record<string, string>>({});
   const [settings, setSettings] = useState<Plugin | null>(null);
   const [readme, setReadme] = useState<{ plugin: Plugin; content: string } | null>(null);
+  const [pluginUi, setPluginUi] = useState<{ plugin: Plugin; url: string } | null>(null);
   const update = (plugin: Plugin, key: string, value: unknown) => setEditing((current) => ({ ...current, [plugin.id]: { ...plugin.config, ...current[plugin.id], [key]: value } }));
   const refresh = () => c.load();
   const openReadme = (plugin: Plugin) => c.act(async () => {
     const result = await api<{ content: string }>(`/plugins/${plugin.id}/readme`);
     setReadme({ plugin, content: result.content });
   });
+  const openPluginUi = (plugin: Plugin) => c.act(async () => {
+    const result = await api<{ url: string }>(`/plugins/${plugin.id}/ui-session`, "POST");
+    setPluginUi({ plugin, url: result.url });
+  });
 
   if (page !== "扩展") return null;
   return <div className="plugin-page">
     <section className="experimental-panel">
-      <p className="eyebrow">PLUGIN API V1 · EXPERIMENTAL</p>
+      <p className="eyebrow">PLUGIN API V2 · PREVIEW</p>
       <h2>{t("plugins.title")}</h2>
       <p>{t("plugins.description")}</p>
       <span className="badge warning-badge">{t("plugins.warning")}</span>
@@ -52,9 +57,20 @@ export function PluginsPage({ c }: { c: ConsoleState }) {
         {plugin.error && <div className="alert error">{plugin.error}</div>}
         <div className="plugin-actions">
           {plugin.has_readme && <button className="secondary" onClick={() => openReadme(plugin)}>{t("plugins.docs")}</button>}
+          {plugin.has_ui && plugin.enabled && <button className="secondary" onClick={() => openPluginUi(plugin)}>{t("plugins.openUi")}</button>}
           {Object.keys(plugin.config_schema).length > 0 && <button className="secondary" onClick={() => setSettings(plugin)}>{t("plugins.settings")}</button>}
+          {plugin.api_version === 2 && plugin.registrations?.some((item) => item.kind === "tool" && Array.isArray(item.metadata.recommended_agents) && item.metadata.recommended_agents.length > 0) && <button className="secondary" onClick={() => c.act(async () => { await api(`/plugins/${plugin.id}/tools/enable-recommended`, "POST"); await refresh(); })}>{t("plugins.recommended")}</button>}
           <button className="secondary" disabled={!plugin.enabled || plugin.runtime_status !== "running"} onClick={() => c.act(async () => { await api(`/plugins/${plugin.id}/reload`, "POST"); await refresh(); }, t("plugins.reloaded"))}>{t("plugins.reload")}</button>
-          <details className="plugin-more"><summary>{t("plugins.more")}</summary><small>{t("plugins.capabilities")}: {plugin.capabilities.join(", ") || "—"}</small></details>
+          <details className="plugin-more"><summary>{t("plugins.more")}</summary>
+            {plugin.api_version === 1 ? <small>{t("plugins.capabilities")}: {plugin.capabilities.join(", ") || "—"} · Legacy</small> : <div className="plugin-extensions">
+              <small>Runtime: {plugin.runtime_mode}</small>
+              {!plugin.registrations?.length && <small>—</small>}
+              {(["hook", "tool", "service", "provider", "route"] as const).map((kind) => {
+                const entries = plugin.registrations?.filter((item) => item.kind === kind) || [];
+                return entries.length ? <div key={kind}><strong>{kind}</strong><ul>{entries.map((item) => <li key={`${kind}-${item.name}`}><code>{item.identifier}</code>{kind === "hook" && <small> · {String(item.metadata.stability || "")}</small>}</li>)}</ul></div> : null;
+              })}
+            </div>}
+          </details>
         </div>
       </section>)}
     </div>
@@ -64,6 +80,12 @@ export function PluginsPage({ c }: { c: ConsoleState }) {
         <SafeMarkdown source={readme.content}/>
       </section>
     </div>}
+    {pluginUi && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPluginUi(null); }}>
+      <section className="modal modal-wide plugin-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-ui-title">
+        <div className="section-head"><div><p className="eyebrow">{pluginUi.plugin.id}</p><h2 id="plugin-ui-title">{pluginUi.plugin.name}</h2></div><button aria-label={t("common.close")} onClick={() => setPluginUi(null)}>×</button></div>
+        <iframe className="plugin-ui-frame" title={pluginUi.plugin.name} src={pluginUi.url} sandbox="allow-scripts allow-same-origin" referrerPolicy="no-referrer" />
+      </section>
+    </div>}
     {settings && (() => {
       const plugin = settings;
       const values = { ...plugin.config, ...editing[plugin.id] };
@@ -71,9 +93,10 @@ export function PluginsPage({ c }: { c: ConsoleState }) {
         <section className="modal plugin-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-settings-title">
           <div className="section-head"><div><p className="eyebrow">{plugin.id}</p><h2 id="plugin-settings-title">{t("plugins.settingsTitle")}</h2></div><button aria-label={t("common.close")} onClick={() => setSettings(null)}>×</button></div>
           <div className="status-grid plugin-connection"><div><strong>{t("plugins.instance")}</strong><small>{plugin.connected_instance || "—"}</small></div><div><strong>{t("plugins.heartbeat")}</strong><small>{plugin.last_heartbeat ? new Date(plugin.last_heartbeat * 1000).toLocaleString() : "—"}</small></div></div>
+          {plugin.api_version === 2 && plugin.runtime_supported.length > 1 && <label className="field"><span>{t("plugins.runtimeMode")}</span><select disabled={plugin.enabled} value={plugin.runtime_mode} onChange={(event) => c.act(async () => { await api(`/plugins/${plugin.id}/runtime`, "PUT", { mode: event.target.value }); setSettings(null); await refresh(); })}>{plugin.runtime_supported.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label>}
           <div className="repo-form plugin-config-form">
             {Object.entries(plugin.config_schema).map(([key, field]) => <label className="field" key={key}><span>{field.title}{field.required ? " *" : ""}</span>
-              {field.type === "boolean" ? <input type="checkbox" checked={Boolean(values[key])} onChange={(event) => update(plugin, key, event.target.checked)} /> : field.type === "select" ? <select value={String(values[key] ?? "")} onChange={(event) => update(plugin, key, event.target.value)}>{field.options.map((option) => <option key={option}>{option}</option>)}</select> : <input type={field.type === "secret" ? "password" : field.type === "integer" ? "number" : "text"} value={field.type === "string_list" ? (Array.isArray(values[key]) ? values[key].join(", ") : "") : String(values[key] ?? "")} onChange={(event) => update(plugin, key, field.type === "string_list" ? event.target.value.split(",").map((item) => item.trim()).filter(Boolean) : field.type === "integer" ? Number(event.target.value) : event.target.value)} />}
+              {field.type === "boolean" ? <input type="checkbox" checked={Boolean(values[key])} onChange={(event) => update(plugin, key, event.target.checked)} /> : field.type === "select" ? <select value={String(values[key] ?? "")} onChange={(event) => update(plugin, key, event.target.value)}>{field.options.map((option) => <option key={option}>{option}</option>)}</select> : field.type === "json" ? <textarea value={typeof values[key] === "string" ? String(values[key]) : JSON.stringify(values[key] ?? {})} onChange={(event) => { try { update(plugin, key, JSON.parse(event.target.value)); } catch { update(plugin, key, event.target.value); } }} /> : <input type={field.type === "secret" ? "password" : field.type === "integer" || field.type === "number" ? "number" : "text"} value={field.type === "string_list" ? (Array.isArray(values[key]) ? values[key].join(", ") : "") : String(values[key] ?? "")} onChange={(event) => update(plugin, key, field.type === "string_list" ? event.target.value.split(",").map((item) => item.trim()).filter(Boolean) : field.type === "integer" || field.type === "number" ? Number(event.target.value) : event.target.value)} />}
               {field.description && <small>{field.description}</small>}
             </label>)}
           </div>
