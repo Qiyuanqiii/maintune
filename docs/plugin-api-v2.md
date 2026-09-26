@@ -85,8 +85,8 @@ than terminating Core.
 
 Registrations happen in `register(api)`, not in the manifest. The in-tree SDK
 currently provides `register_hook`, `on_task_finally`, `register_tool`,
-`register_service`, `register_model_provider`, and
-`register_sandbox_provider`. Registration names become
+`register_service`, `register_model_provider`,
+`register_sandbox_provider`, and `register_route`. Registration names become
 `<plugin-id>/<name>` in Core. Duplicate names and invalid metadata are
 rejected. The registry is an interface boundary; each extension needs its
 own end-to-end gate before being described as operational in production.
@@ -97,6 +97,7 @@ own end-to-end gate before being described as operational in production.
 | --- | --- | --- | --- | --- |
 | `task.started` | Stable | Notification | Parallel, fail open | Observe task start. |
 | `task.finally` | Stable | Notification/finalizer | Serial, fail open | Observe a genuinely finished task. |
+| `issue.analysis_prompt` | Experimental | Pipeline | Serial, fail open | Adjust the Issue analysis prompt before the next plugin sees it. |
 | `pr.review` | Experimental | Replaceable | Serial, fail open | Return a structured replacement review, or continue/cancel/wait. |
 
 Hook behavior, timeout, retry safety, schema, and ordering belong to each
@@ -173,7 +174,7 @@ Plugins settings UI remains the single place to enter and mask those fields.
 The target migration order is: plugin custom migration, Core reconciliation
 with new defaults and removed fields, validation, then one atomic save.
 Failure must preserve the old config and prevent the new plugin from starting.
-The optional `on_upgrade(old_version, new_version)` concerns plugin-owned
+The optional `on_upgrade(context, old_version, new_version)` concerns plugin-owned
 data. A failure preserves its data for diagnosis; automatic rollback of the
 entire data directory is outside Preview 3.
 
@@ -188,9 +189,11 @@ reload there is best effort.
 
 Optional plugin UI belongs only under the dedicated Plugins area. It cannot
 inject arbitrary components into Dashboard, Task, or PR pages. The declared
-UI mode may be bundled resources or an iframe page. Plugin HTTP routes stay
-under `/api/plugins/<plugin-id>/...`; access to the Core route namespace is
-not part of the contract. Authentication rules for a route must be explicit.
+UI mode may be bundled resources or an iframe page. `register_route(name,
+handler, methods=("GET",), access="authenticated")` exposes a static route
+under `/api/plugins/<plugin-id>/...`; `access="external"` requires the plugin
+to implement its own authentication. Access to the Core route namespace is
+not part of the contract.
 
 The current GitHub Core Client accepts `github.issue.get` and
 `github.pull.get` with a `task_id`; these load the matching task's repository
