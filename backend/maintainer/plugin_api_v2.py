@@ -67,6 +67,25 @@ def validate_schema(schema: Any, *, root_object: bool = False) -> None:
             raise PluginSchemaError(f"Invalid {key}")
 
 
+def validate_config_schema(schema: Any) -> None:
+    """Config persistence encrypts only direct, string-valued secret properties."""
+    validate_schema(schema, root_object=True)
+
+    def check(node: dict[str, Any], depth: int) -> None:
+        if node.get("secret"):
+            if depth != 1 or node["type"] != "string":
+                raise PluginSchemaError("Config secrets must be top-level string properties")
+            if "default" in node or "enum" in node:
+                raise PluginSchemaError("Config secrets cannot declare defaults or enum values")
+        if node["type"] == "object":
+            for child in node.get("properties", {}).values():
+                check(child, depth + 1)
+        elif node["type"] == "array":
+            check(node["items"], depth + 1)
+
+    check(schema, 0)
+
+
 def validate_value(schema: dict[str, Any], value: Any, path: str = "input") -> None:
     validate_schema(schema)
     kind = schema["type"]
@@ -113,7 +132,6 @@ class HookSpec:
     concurrency: Literal["serial", "parallel"]
     failure: Literal["open", "closed"]
     timeout: float
-    max_timeout: float
     retry_safe: bool
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
@@ -187,10 +205,10 @@ _REVIEW_OUTPUT = {
 }
 
 HOOKS: dict[str, HookSpec] = {
-    "task.started": HookSpec("task.started", "stable", "notification", "parallel", "open", 2, 10, True, _OBJECT),
-    "task.finally": HookSpec("task.finally", "stable", "notification", "serial", "open", 5, 30, False, _TASK_FINAL),
-    "issue.analysis_prompt": HookSpec("issue.analysis_prompt", "experimental", "pipeline", "serial", "open", 5, 30, False, _ISSUE_PROMPT, _PIPELINE_OUTPUT),
-    "pr.review": HookSpec("pr.review", "experimental", "replaceable", "serial", "open", 30, 120, False, _OBJECT, _REVIEW_OUTPUT),
+    "task.started": HookSpec("task.started", "stable", "notification", "parallel", "open", 2, True, _OBJECT),
+    "task.finally": HookSpec("task.finally", "stable", "notification", "serial", "open", 5, False, _TASK_FINAL),
+    "issue.analysis_prompt": HookSpec("issue.analysis_prompt", "experimental", "pipeline", "serial", "open", 5, False, _ISSUE_PROMPT, _PIPELINE_OUTPUT),
+    "pr.review": HookSpec("pr.review", "experimental", "replaceable", "serial", "open", 30, False, _OBJECT, _REVIEW_OUTPUT),
 }
 
 

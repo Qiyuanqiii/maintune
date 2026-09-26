@@ -12,7 +12,7 @@
 | Finalizer | `task.finally` | Stable | Task 结束时记录状态；用 `invocation_id` 防止重试重复写入 |
 | Hook | `pr.review` | Experimental | 返回 `continue`，不改写审查决策 |
 | Service | `example.workflow-notes/activity.stats` | v2 | 返回已记录的启动和结束计数 |
-| Agent Tool | `example.workflow-notes/activity_count` | v2 | 按 `started` 或 `finalized` 查询计数；推荐 `issue_analyzer`，安装后仍需管理员启用 |
+| Agent Tool | `example.workflow-notes/activity_count` | v2 | 按 `started` 或 `finalized` 查询计数；推荐 `code_worker`，安装后仍需管理员启用 |
 
 配置字段：`label`（Tool 输出标签，默认 `Maintune`）、`record_started`（是否记录启动事件，默认 `true`）。数据写入宿主给出的 `data_dir/events`。每次调用以 `kind + invocation_id` 生成固定文件名；记录只保留 Task ID、最终状态和 attempt，不保存 Hook 全文、Prompt 或凭据。
 
@@ -42,7 +42,7 @@ Workflow Notes is a runnable third-party **Plugin API v2** example. It imports o
 
 Run `python build_mtp.py` to create `dist/workflow-notes-example.mtp`, then install and enable it in a Maintune build with Plugin API v2. The package uses the isolated runtime and a standard empty `requirements.txt`. Its JSON-formatted `manifest.yaml` is accepted by Maintune's safe YAML-subset parser.
 
-The Stable `task.started` Hook saves an observation when `record_started` is true. The Stable `task.finally` finalizer records Task status and attempt. Records use a filename derived from `kind + invocation_id`, so replaying the same invocation does not duplicate a record. The Experimental `pr.review` Hook always returns `continue`; it never changes the review decision. The namespaced Service `example.workflow-notes/activity.stats` returns start/final counts. The namespaced Tool `example.workflow-notes/activity_count` reads one count and recommends `issue_analyzer`; an administrator must still enable the Tool for an Agent.
+The Stable `task.started` Hook saves an observation when `record_started` is true. The Stable `task.finally` finalizer records Task status and attempt. Records use a filename derived from `kind + invocation_id`, so replaying the same invocation does not duplicate a record. The Experimental `pr.review` Hook always returns `continue`; it never changes the review decision. The namespaced Service `example.workflow-notes/activity.stats` returns start/final counts. The namespaced Tool `example.workflow-notes/activity_count` reads one count and recommends `code_worker`; an administrator must still enable it. Preview 3 injects plugin Tools only into `code_worker`.
 
 Configuration contains `label` (default `Maintune`) and `record_started` (default `true`). Stored records contain only Task ID, final status and attempt, never the complete Hook payload or credentials. The manifest's `example.anysearch` dependency is **optional** and demonstrates dependency metadata only; this plugin never calls that Tool.
 

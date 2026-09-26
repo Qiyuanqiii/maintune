@@ -21,8 +21,6 @@ class PluginContext:
     data_dir: Path
     config: Mapping[str, Any] = field(repr=False)
     invocation_id: str = ""
-    task_id: str | None = None
-    agent_id: str | None = None
     _core_call: Callable[[str, dict[str, Any]], Any] | None = field(default=None, repr=False, compare=False)
     _cancelled: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
 

@@ -15,6 +15,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic-settings>=2.7,<3",
   "PyJWT[crypto]>=2.10,<3",
+  "packaging>=24,<27",
   "openhands-sdk==1.47.0",
 ]
 license = "AGPL-3.0-only"

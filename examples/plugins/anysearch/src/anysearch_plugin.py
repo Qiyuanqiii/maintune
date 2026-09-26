@@ -170,5 +170,5 @@ def register(api: PluginAPI) -> None:
             "required": ["query"],
             "additionalProperties": False,
         },
-        recommended_agents=["issue_analyzer", "pr_reviewer", "ci_analyzer"],
+        recommended_agents=["code_worker"],
     )

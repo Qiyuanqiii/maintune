@@ -200,17 +200,12 @@ class _Peer:
                 invocation_id = str(params.get("invocation_id") or identifier)
                 if not invocation_id or invocation_id in self.invocations:
                     raise ValueError("Invocation ID is missing or already active")
-                public_context = params.get("context") or {}
-                if not isinstance(public_context, dict):
-                    raise ValueError("Invocation context must be an object")
                 call_context = PluginContext(
                     plugin_id=self.context.plugin_id,
                     plugin_version=self.context.plugin_version,
                     data_dir=self.context.data_dir,
                     config=self.context.config,
                     invocation_id=invocation_id,
-                    task_id=public_context.get("task_id"),
-                    agent_id=public_context.get("agent_id"),
                     _core_call=self.call_core,
                 )
                 self.invocations[invocation_id] = call_context

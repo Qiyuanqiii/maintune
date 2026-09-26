@@ -257,16 +257,17 @@ class TaskProcessor:
             github_config = db.get(Config, "github")
             installation_id = task.data.get("installation_id") or (repo.installation_id if repo else None) or (github_config.data.get("installation_id") if github_config else None)
             kind, number, repo_name = task.kind, task.number, task.repository
-            existing_snapshots = list(db.scalars(select(RuntimeSnapshot).where(RuntimeSnapshot.task_id == task_id)))
-            if not existing_snapshots:
-                resolved = resolve_all_agents(db)
-                for agent_id, config in resolved.items():
-                    db.add(RuntimeSnapshot(task_id=task_id, agent_id=agent_id, data=config.model_dump()))
-                if resolved:
-                    task.lease_until = time.time() + max(config.task_timeout for config in resolved.values()) + 60
-                    self.event(db, task_id, "runtime_config_resolved", {"configs": [config.audit_snapshot() for config in resolved.values()]})
-        self.emit_plugin_event("task.started", task_id, {"attempt": task.attempts})
         try:
+            with self.sessions.begin() as db:
+                existing_snapshots = list(db.scalars(select(RuntimeSnapshot).where(RuntimeSnapshot.task_id == task_id)))
+                if not existing_snapshots:
+                    resolved = resolve_all_agents(db)
+                    for agent_id, config in resolved.items():
+                        db.add(RuntimeSnapshot(task_id=task_id, agent_id=agent_id, data=config.model_dump()))
+                    if resolved:
+                        db.get(Task, task_id).lease_until = time.time() + max(config.task_timeout for config in resolved.values()) + 60
+                        self.event(db, task_id, "runtime_config_resolved", {"configs": [config.audit_snapshot() for config in resolved.values()]})
+            self.emit_plugin_event("task.started", task_id, {"attempt": task.attempts})
             if self.plugins:
                 hook = await self.plugins.dispatch_hook("task.started", {"task_id": task_id, "repository": repo_name, "number": number, "kind": kind, "attempt": task.attempts})
                 if hook.steps:
@@ -281,6 +282,9 @@ class TaskProcessor:
                 await self.process_issue(task_id, github, installation_id, repo_name, number, repo_data)
             else:
                 await self.process_pull(task_id, github, installation_id, repo_name, number, repo_data)
+        except asyncio.CancelledError:
+            self.change_status(task_id, "interrupted", summary="Task execution was cancelled; inspect and retry manually.")
+            raise
         except Exception as error:
             stage = error.stage if isinstance(error, TaskStageError) else "task_dispatch"
             cause = error.cause if isinstance(error, TaskStageError) else error

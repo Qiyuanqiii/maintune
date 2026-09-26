@@ -47,7 +47,7 @@ class WorkflowNotesTests(unittest.TestCase):
         schema = values[("tool", "activity_count")]["input_schema"]
         self.assertEqual(schema["properties"]["kind"], {"type": "string", "enum": ["started", "finalized"]})
         self.assertEqual(schema["required"], ["kind"])
-        self.assertEqual(values[("tool", "activity_count")]["recommended_agents"], ["issue_analyzer"])
+        self.assertEqual(values[("tool", "activity_count")]["recommended_agents"], ["code_worker"])
 
     def test_hook_finalizer_service_and_tool_use_data_dir(self):
         context = self.context()

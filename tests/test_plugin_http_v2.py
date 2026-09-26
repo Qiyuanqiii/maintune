@@ -1,6 +1,8 @@
 import json
 import zipfile
 
+import pytest
+
 from test_foundation import app, client
 from maintainer.providers import Completion
 
@@ -9,7 +11,7 @@ def test_plugin_routes_are_namespaced_and_ui_requires_scoped_session(app, client
     manifest = {
         "id": "example.http-test", "name": "HTTP Test", "version": "0.1.0-dev",
         "plugin_api": 2, "publisher": "mcxianyujun", "license": "MIT",
-        "maintune": {"min_version": "0.1.0"},
+        "maintune": {"min_version": "0.1.0-preview.3"},
         "entrypoint": {"python": "http_test.main"},
         "ui": {"mode": "bundled", "entrypoint": "ui/index.html"},
     }
@@ -53,7 +55,7 @@ def test_plugin_sandbox_is_selectable_and_probe_uses_plugin(app, client):
     manifest = {
         "id": "example.sandbox-http", "name": "Sandbox HTTP", "version": "0.1.0-dev",
         "plugin_api": 2, "publisher": "mcxianyujun", "license": "MIT",
-        "maintune": {"min_version": "0.1.0"}, "entrypoint": {"python": "sandbox_http.main"},
+        "maintune": {"min_version": "0.1.0-preview.3"}, "entrypoint": {"python": "sandbox_http.main"},
     }
     source = '''
 files = {}
@@ -94,7 +96,7 @@ def test_plugin_model_provider_is_selectable_and_used_by_diagnostic(app, client)
     manifest = {
         "id": "example.model-http", "name": "Model HTTP", "version": "0.1.0-dev",
         "plugin_api": 2, "publisher": "mcxianyujun", "license": "MIT",
-        "maintune": {"min_version": "0.1.0"}, "entrypoint": {"python": "model_http.main"},
+        "maintune": {"min_version": "0.1.0-preview.3"}, "entrypoint": {"python": "model_http.main"},
         "config_schema": {"type": "object", "properties": {"endpoint_key": {"type": "string", "secret": True}}, "required": ["endpoint_key"], "additionalProperties": False},
     }
     source = '''
@@ -111,7 +113,15 @@ def register(api):
         bundle.writestr("src/model_http/__init__.py", "")
         bundle.writestr("src/model_http/main.py", source)
     assert client.post("/api/plugins/install/model-http.mtp").status_code == 201
-    assert client.put("/api/plugins/example.model-http/config", json={"endpoint_key": "fake-provider-key"}).status_code == 200
+    configured = client.put("/api/plugins/example.model-http/config", json={"endpoint_key": "fake-provider-key"})
+    assert configured.status_code == 200
+    assert configured.json()["config"]["endpoint_key"] == "********"
+    assert "fake-provider-key" not in configured.text
+    record = app.state.plugins._record("example.model-http")
+    assert "fake-provider-key" not in json.dumps(record)
+    assert app.state.plugins.vault.decrypt(record["secrets"]["endpoint_key"]) == "fake-provider-key"
+    assert "fake-provider-key" not in client.get("/api/plugins").text
+    assert "fake-provider-key" not in client.put("/api/plugins/example.model-http/config", json={"endpoint_key": "********"}).text
     assert client.post("/api/plugins/example.model-http/enable").status_code == 200
     provider = next(item for item in client.get("/api/providers").json() if item["type"] == "plugin")
     assert provider["models"][0]["id"] == "example-model"
@@ -141,3 +151,39 @@ def register(api):
     assert client.get("/api/setup/status").json()["steps"]["model"] is False
     assert next(item for item in client.get("/api/providers").json() if item["id"] == provider["id"])["available"] is False
     assert client.put("/api/settings", json=settings).status_code == 409
+
+
+@pytest.mark.parametrize("secret_location", ["object", "array", "root", "default", "enum", "nonstring"])
+def test_plugin_config_rejects_unprotected_or_embedded_secrets(app, client, secret_location):
+    secret = {"type": "string", "secret": True}
+    if secret_location == "default":
+        secret["default"] = "PRIVATE_DEFAULT_VALUE"
+    elif secret_location == "enum":
+        secret["enum"] = ["PRIVATE_ENUM_VALUE"]
+    elif secret_location == "nonstring":
+        secret["type"] = "integer"
+    if secret_location == "object":
+        field = {"type": "object", "properties": {"token": secret}}
+    elif secret_location == "array":
+        field = {"type": "array", "items": secret}
+    else:
+        field = secret
+    schema = {"type": "object", "properties": {"credentials": field}}
+    if secret_location == "root":
+        schema["secret"] = True
+    manifest = {
+        "id": "example.unsafe-secret", "name": "Unsafe Secret", "version": "0.1.0-dev",
+        "plugin_api": 2, "publisher": "mcxianyujun", "license": "MIT",
+        "maintune": {"min_version": "0.1.0-preview.3"},
+        "entrypoint": {"python": "unsafe_secret.main"},
+        "config_schema": schema,
+    }
+    archive = app.state.plugins.packages.inbox / "unsafe-secret.mtp"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("manifest.yaml", json.dumps(manifest))
+        bundle.writestr("src/unsafe_secret/__init__.py", "")
+        bundle.writestr("src/unsafe_secret/main.py", "def register(api): pass\n")
+    response = client.post("/api/plugins/install/unsafe-secret.mtp")
+    assert response.status_code == 422
+    assert "PRIVATE_" not in response.text
+    assert "example.unsafe-secret" not in str(client.get("/api/plugins").json())

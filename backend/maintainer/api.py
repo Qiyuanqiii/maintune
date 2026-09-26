@@ -206,7 +206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with sessions() as db:
             github = db.get(Config, "github")
             email = db.get(Config, "email")
-        return {"stage": "github-automation", "runtime": "OpenHands adapter with controlled sandbox tools", "github_automation": bool(github and github.data.get("private_key") and github.data.get("webhook_secret")), "auto_merge": True, "plugins": False, "email": bool(email and email.data.get("enabled")), "docker_sandbox": False, "openhands": "1.47.0 integrated", "version": __version__}
+        return {"stage": "github-automation", "runtime": "OpenHands adapter with controlled sandbox tools", "github_automation": bool(github and github.data.get("private_key") and github.data.get("webhook_secret")), "auto_merge": True, "plugins": True, "email": bool(email and email.data.get("enabled")), "docker_sandbox": False, "openhands": "1.47.0 integrated", "version": __version__}
 
     def masked_config(key: str, secret_fields: tuple[str, ...]):
         with sessions() as db:

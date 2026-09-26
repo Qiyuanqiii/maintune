@@ -95,5 +95,5 @@ def register(api: PluginAPI) -> None:
     api.register_tool(
         "activity_count", activity_count,
         description="Count task start or finalization observations recorded by this plugin.",
-        recommended_agents=["issue_analyzer"],
+        recommended_agents=["code_worker"],
     )

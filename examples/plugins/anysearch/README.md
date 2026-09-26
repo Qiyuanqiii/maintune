@@ -5,7 +5,7 @@
 ## 功能与安装
 
 - Tool：`example.anysearch/search`，接收搜索词和最多 10 条的结果请求，返回可引用的 URL、标题及摘要。
-- 推荐 Agent：`issue_analyzer`、`pr_reviewer`、`ci_analyzer`。**推荐不等于自动启用**；安装后由管理员选择给哪些 Agent 开启。
+- 推荐 Agent：`code_worker`。Preview 3 仅在该 Agent 的运行路径注入插件 Tool；**推荐不等于自动启用**，安装后仍须管理员开启。
 - Runtime：仅支持独立进程 `isolated`。Python 依赖文件 `requirements.txt` 不含第三方包；宿主负责提供公开 SDK。
 - 不使用 Hook、Service、Provider 或插件 UI。
 
@@ -49,7 +49,7 @@ python -m unittest discover -s tests -v
 
 This independent **Plugin API v2** preview example exposes AnySearch as a Maintune Agent Tool. It imports only the public `maintune-plugin-sdk` and uses the Python standard library for HTTP. Maintune Core contains no AnySearch-specific logic. This example has not been released separately.
 
-Build the `.mtp` with `python build_mtp.py`, install `dist/example-anysearch.mtp` through Maintune, configure an API key, enable the plugin, and explicitly enable its Tool for the Agents you choose. The Tool is `example.anysearch/search`; the recommended Agents are `issue_analyzer`, `pr_reviewer`, and `ci_analyzer`. Recommendations do not grant automatic access. The isolated runtime uses an empty standard `requirements.txt`; the host supplies the public SDK.
+Build the `.mtp` with `python build_mtp.py`, install `dist/example-anysearch.mtp` through Maintune, configure an API key, enable the plugin, and explicitly enable its Tool for `code_worker`. Preview 3 injects plugin Tools only into that Agent. The Tool is `example.anysearch/search`; recommendations do not grant automatic access. The isolated runtime uses an empty standard `requirements.txt`; the host supplies the public SDK.
 
 `api_key` is required, encrypted at rest, and masked in the UI. Optional settings are `base_url` (HTTPS, default `https://api.anysearch.com`), `max_results` (1–10, default 10), `zone` (`cn` or `intl`), and `language`. Each call makes one `POST /v1/search` request with a Bearer header and returns citeable URLs, titles, and snippets. Redirects are refused, and error messages never include the server response body. External search results are untrusted content.
 

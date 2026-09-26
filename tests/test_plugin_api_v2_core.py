@@ -64,6 +64,11 @@ def test_v2_manifest_and_isolated_tool_runtime(tmp_path):
         view = await manager.enable(MANIFEST["id"])
         assert view["runtime_status"] == "running"
         assert view["registrations"][0]["identifier"] == "example.v2-test/search"
+        assert manager.enable_recommended_tools(MANIFEST["id"]) == {"code_worker": ["example.v2-test/search"]}
+        assert [tool.identifier for tool in manager.agent_tools("code_worker")] == ["example.v2-test/search"]
+        assert manager.agent_tools("issue_analyzer") == []
+        with pytest.raises(Exception, match="Invalid Agent Tool selection"):
+            manager.set_agent_tools("issue_analyzer", ["example.v2-test/search"])
         result = await manager.invoke_tool("example.v2-test/search", {"query": "hello"})
         assert result == "result: hello"
         with pytest.raises(Exception, match="required|query"):
@@ -704,10 +709,82 @@ def test_failed_task_finalizer_keeps_same_invocation_for_retry(tmp_path):
     manager._invoke_extension = invoke
     asyncio.run(manager.finalize_task(task_id))
     with sessions() as db:
-        record = db.get(Config, f"plugin-finalizer:{task_id}:example.finalizer")
+        record = db.get(Config, f"plugin-finalizer:{task_id}:1:example.finalizer")
         assert record.data["status"] == "incomplete"
     asyncio.run(manager.finalize_task(task_id))
     assert calls[0] == calls[1]
     with sessions() as db:
-        assert db.get(Config, f"plugin-finalizer:{task_id}:example.finalizer").data["status"] == "completed"
+        assert db.get(Config, f"plugin-finalizer:{task_id}:1:example.finalizer").data["status"] == "completed"
     engine.dispose()
+
+
+@pytest.mark.parametrize("failure_point,expected_status", [
+    ("runtime_config", "failed_environment"),
+    ("provider", "failed_agent"),
+    ("cancelled", "interrupted"),
+])
+def test_task_processor_runs_finalizer_on_real_terminal_paths(tmp_path, monkeypatch, failure_point, expected_status):
+    engine, sessions = database(f"sqlite:///{tmp_path / 'processor-finalizer.db'}")
+    vault = Vault(Fernet.generate_key().decode())
+    manager = PluginManager(tmp_path / "plugins", "0.1.0-preview.3", sessions, vault)
+    manager.registry.register_plugin("example.finalizer", [{"kind": "hook", "name": "task.finally"}])
+    with sessions.begin() as db:
+        db.add(Config(id="general", data={}))
+        db.add(Config(id="github", data={"app_id": 1, "private_key": vault.encrypt("private")}))
+        db.add(Repository(full_name="owner/repo", installation_id=1, data={"default_branch": "main", "additional_instructions": ""}))
+        task = Task(kind="issue", repository="owner/repo", number=1, event="issues.opened", delivery_id=f"processor-{failure_point}", data={})
+        db.add(task)
+        db.flush()
+        task_id = task.id
+    calls = []
+
+    async def invoke(registration, payload, invocation_id, timeout):
+        calls.append((payload["task_id"], payload["status"], invocation_id))
+
+    issue_started = asyncio.Event()
+
+    class GitHub:
+        async def issue_context(self, *_):
+            if failure_point == "cancelled":
+                issue_started.set()
+                await asyncio.Event().wait()
+            return {"issue": {"title": "Fix broken login", "body": "Login fails on every attempt"}, "comments": []}
+
+        async def repository_guidance(self, *_):
+            return ""
+
+    if failure_point == "runtime_config":
+        monkeypatch.setattr("maintainer.tasks.resolve_all_agents", lambda db: (_ for _ in ()).throw(ValueError("Runtime configuration is invalid")))
+    else:
+        monkeypatch.setattr("maintainer.tasks.resolve_all_agents", lambda db: {})
+    manager._invoke_extension = invoke
+    processor = TaskProcessor(sessions, vault, SimpleNamespace(), plugins=manager)
+    processor.app_client = GitHub
+    try:
+        if failure_point == "cancelled":
+            async def cancel_running_task():
+                running = asyncio.create_task(processor.process(task_id))
+                await asyncio.wait_for(issue_started.wait(), 5)
+                running.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await running
+
+            asyncio.run(cancel_running_task())
+        else:
+            asyncio.run(processor.process(task_id))
+        asyncio.run(processor.process(task_id))
+        with sessions() as db:
+            assert db.get(Task, task_id).status == expected_status
+            assert len(list(db.query(Timeline).filter(Timeline.task_id == task_id, Timeline.kind == "plugin_finalizer_completed"))) == 1
+        assert len(calls) == 1
+        assert calls[0][:2] == (task_id, expected_status)
+        if failure_point == "provider":
+            with sessions.begin() as db:
+                db.get(Task, task_id).status = "queued"
+            asyncio.run(processor.process(task_id))
+            with sessions() as db:
+                assert db.get(Task, task_id).attempts == 2
+                assert len(list(db.query(Timeline).filter(Timeline.task_id == task_id, Timeline.kind == "plugin_finalizer_completed"))) == 2
+            assert len(calls) == 2 and calls[0][2] != calls[1][2]
+    finally:
+        engine.dispose()

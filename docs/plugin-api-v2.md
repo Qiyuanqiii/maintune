@@ -69,9 +69,11 @@ async def search(query: str) -> dict:
 The host assigns the public ID `example.search/search`; extension names are
 always scoped to the package ID. A handler may accept a leading
 `context: PluginContext` argument. Context exposes plugin ID/version,
-`data_dir`, validated config, `invocation_id`, optional task/agent IDs,
+`data_dir`, validated config, `invocation_id`,
 advisory cancellation, and documented `call_core(...)` methods. It does not
 contain ORM, Controller, or GitHub credential objects.
+Preview 3 does not provide task or Agent IDs on `PluginContext`; Hooks carry
+task IDs in their validated input when applicable.
 
 Preview 3's formal isolated transport is newline-delimited JSON-RPC 2.0 over
 stdio. Messages are bounded to 1 MiB. The protocol is language neutral so a
@@ -103,11 +105,20 @@ own end-to-end gate before being described as operational in production.
 Hook behavior, timeout, retry safety, schema, and ordering belong to each
 catalog entry. Serial modifiable Hooks must pass each validated result to the
 next plugin; invalid output cannot flow onward. Priority orders different
-plugins, with load order resolving equal priorities. The host retains the
-original input and each step's result for debugging. `task.finally` is an
+plugins, with load order resolving equal priorities. The Issue prompt Hook's
+timeline records hashes of its input and output plus step status, without
+storing full prompt text. `task.finally` is an
 independent task lifecycle finalizer: ordinary Hook cancellation cannot skip
 it. If execution is physically impossible, the host must record that failure
 instead of pretending the finalizer succeeded.
+The processor dispatches it after a terminal outcome, including provider
+errors and worker cancellation (recorded as `interrupted`). A persisted
+invocation ID prevents a completed finalizer from running twice for the same
+task attempt and plugin; an incomplete invocation may be retried with that ID.
+An Owner retry starts a new attempt and receives a new finalizer invocation.
+Process death and forced termination cannot execute Python cleanup code, so
+startup records an interrupted task for inspection. Delivery then requires a
+manual retry; exactly-once external effects require plugin-side idempotency.
 
 `pr.review` accepts a replacement only after Core checks its structured
 result against the current PR head SHA. It does not grant the plugin direct
@@ -124,6 +135,8 @@ schema and arguments. Newly installed Tools are **not** enabled for an Agent
 automatically; a recommendation requires an explicit owner action. Tools
 return one text/JSON result in Preview 3. Cancellation is advisory first,
 with a host watchdog as fallback.
+Only `code_worker` can invoke plugin Tools in the current Agent runtime.
+Recommendations and enablement for other Agents are unsupported in Preview 3.
 
 `register_service` exposes an explicitly named plugin-to-plugin operation.
 Its input/output schemas are optional for simple JSON-serializable services.
@@ -165,6 +178,9 @@ defaults, and `secret` fields. Maintune is responsible for validation,
 storage, encryption, and masked UI display. A plugin can use its dedicated
 `data_dir` for its own JSON, SQLite, or other files; Core offers no separate
 storage abstraction.
+For Preview 3, `secret: true` is supported only on direct string properties
+of the root config object. Nested secret declarations, secret defaults, and
+secret enums are rejected when the package is installed.
 
 A Provider's runtime `config_schema` describes the fields it uses from the
 plugin's manifest `config_schema`. Core requires matching types and `secret`

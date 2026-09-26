@@ -529,13 +529,15 @@ class PluginManager:
         return await self.registry.dispatch_hook(name, payload, self._invoke_extension)
 
     def agent_tools(self, agent_id: str) -> list[ExtensionRegistration]:
+        if agent_id != "code_worker":
+            return []
         with self.sessions() as db:
             row = db.get(Config, f"plugin-tools:{agent_id}")
             selected = set(row.data.get("tools", [])) if row else set()
         return [item for item in self.registry.list("tool") if item.identifier in selected]
 
     def set_agent_tools(self, agent_id: str, identifiers: list[str]) -> list[str]:
-        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", agent_id) or not isinstance(identifiers, list) or len(identifiers) > 64:
+        if agent_id != "code_worker" or not isinstance(identifiers, list) or len(identifiers) > 64:
             raise PluginError("Invalid Agent Tool selection")
         available = {item.identifier for item in self.registry.list("tool")}
         if any(not isinstance(value, str) or value not in available for value in identifiers):
@@ -555,7 +557,8 @@ class PluginManager:
             if item.plugin_id != plugin_id:
                 continue
             for agent_id in item.metadata.get("recommended_agents", []):
-                recommendations.setdefault(agent_id, []).append(item.identifier)
+                if agent_id == "code_worker":
+                    recommendations.setdefault(agent_id, []).append(item.identifier)
         for agent_id, identifiers in recommendations.items():
             existing = [item.identifier for item in self.agent_tools(agent_id)]
             self.set_agent_tools(agent_id, existing + identifiers)
@@ -578,7 +581,7 @@ class PluginManager:
                 "summary": str(task.data.get("summary") or task.data.get("error") or "")[:8000],
             }
         for registration in [item for item in self.registry.list("hook") if item.name == "task.finally"]:
-            record_id = f"plugin-finalizer:{task_id}:{registration.plugin_id}"
+            record_id = f"plugin-finalizer:{task_id}:{payload['attempt']}:{registration.plugin_id}"
             with self.sessions.begin() as db:
                 record = db.get(Config, record_id)
                 if record and record.data.get("status") == "completed":
@@ -829,6 +832,7 @@ class PluginManager:
                     "identifier": item.identifier,
                     "metadata": {
                         **item.metadata,
+                        **({"recommended_agents": [agent for agent in item.metadata.get("recommended_agents", []) if agent == "code_worker"]} if item.kind == "tool" else {}),
                         **({"stability": HOOKS[item.name].stability, "behavior": HOOKS[item.name].behavior, "failure": HOOKS[item.name].failure, "timeout": HOOKS[item.name].timeout} if item.kind == "hook" else {}),
                     },
                 }

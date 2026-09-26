@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 
@@ -169,8 +170,8 @@ class PluginManifest(BaseModel):
         if len({item.id for item in self.dependencies}) != len(self.dependencies):
             raise ValueError("duplicate Maintune plugin dependency")
         if self.config_schema is not None:
-            from .plugin_api_v2 import validate_schema
-            validate_schema(self.config_schema, root_object=True)
+            from .plugin_api_v2 import validate_config_schema
+            validate_config_schema(self.config_schema)
         return self
 
     @field_validator("id")
@@ -386,7 +387,13 @@ class PluginPackageManager:
             raise PluginPackageError("Plugin UI entrypoint is missing")
         if any(PurePosixPath(name).name.casefold() in {"install.py", "setup.sh", "post_install.py"} for name in seen):
             raise PluginPackageError("Custom plugin installation scripts are not supported")
-        if self._version_tuple(manifest.maintune.min_version) > self._version_tuple(self.maintune_version):
+        # A bare floor such as 0.1.0 historically admitted Preview builds of
+        # that release. Keep that contract while comparing explicit Preview
+        # numbers accurately (preview.4 must not run on preview.3).
+        minimum = manifest.maintune.min_version
+        if re.fullmatch(r"\d+\.\d+\.\d+", minimum):
+            minimum += ".dev0"
+        if self._version_tuple(minimum) > self._version_tuple(self.maintune_version):
             raise PluginPackageError("Plugin requires a newer Maintune version")
         if manifest.maintune.max_version and self._version_tuple(manifest.maintune.max_version) < self._version_tuple(self.maintune_version):
             raise PluginPackageError("Plugin does not support this Maintune version")
@@ -398,9 +405,11 @@ class PluginPackageManager:
         return manifest
 
     @staticmethod
-    def _version_tuple(value: str) -> tuple[int, int, int]:
-        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value)
-        return tuple(map(int, match.groups())) if match else (0, 0, 0)
+    def _version_tuple(value: str) -> Version:
+        try:
+            return Version(value)
+        except InvalidVersion as error:
+            raise PluginPackageError("Invalid Maintune compatibility version") from error
 
     def install(self, archive: Path, *, replace: bool = False) -> PluginManifest:
         manifest = self.validate(archive)
@@ -808,8 +817,6 @@ class InProcessPlugin:
             data_dir=self.context.data_dir,
             config=self.context.config,
             invocation_id=invocation_id,
-            task_id=(params.get("context") or {}).get("task_id"),
-            agent_id=(params.get("context") or {}).get("agent_id"),
             _core_call=self.context._core_call,
         )
         async def invoke():

@@ -65,7 +65,7 @@ class AnySearchTests(unittest.TestCase):
         self.assertEqual(len(api.registrations()), 1)
         tool = api.registrations()[0]
         self.assertEqual((tool["kind"], tool["name"]), ("tool", "search"))
-        self.assertEqual(tool["recommended_agents"], ["issue_analyzer", "pr_reviewer", "ci_analyzer"])
+        self.assertEqual(tool["recommended_agents"], ["code_worker"])
         self.assertEqual(tool["input_schema"]["required"], ["query"])
         self.assertEqual(tool["input_schema"]["properties"]["max_results"]["maximum"], 10)
 
