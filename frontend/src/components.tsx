@@ -50,7 +50,7 @@ export function ModelSelect({
         {inherit ? t("model.followMain") : t("model.select")}
       </option>
       {providers.map((p) => (
-        <optgroup key={p.id} label={p.name}>
+        <optgroup key={p.id} label={p.name} disabled={p.available === false}>
           {p.models.filter((m) => m.enabled).map((m) => (
             <option
               key={m.id}

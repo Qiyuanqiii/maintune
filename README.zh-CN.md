@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-自托管的 GitHub 仓库维护控制台。**v0.1.0-preview.2** 通过 GitHub App 接收 Issue 与 Pull Request 事件，由受控 Agent 提出修改或审核意见，再由 Controller 与确定性 Policy 执行 GitHub 写操作。
+自托管的 GitHub 仓库维护控制台。**v0.1.0-preview.3 候选版**通过 GitHub App 接收 Issue 与 Pull Request 事件，由受控 Agent 提出修改或审核意见，再由 Controller 与确定性 Policy 执行 GitHub 写操作。
 
 ## Preview 能力
 
@@ -56,7 +56,7 @@ docker compose up -d --wait
 | Windows 11 安装器 | Available，真实 Docker Desktop E2E 待人工验证 |
 | Linux 安装器 | Available，Ubuntu 24.04 验收目标 |
 | Docker Compose | Available，本地构建 |
-| 公共预构建容器 | **Not provided in v0.1.0-preview.2** |
+| 公共预构建容器 | **当前预览候选版不提供** |
 
 为避免重新分发一个许可条款目前不够明确的传递 Runtime 工件，Preview 安装器会在用户机器上构建镜像，并从官方包源取得固定版本依赖。安装需要访问 GitHub、PyPI 和基础镜像仓库；Preview 不支持完整离线安装。技术说明见 [Runtime 依赖](docs/licensing/runtime-dependencies.md)。
 

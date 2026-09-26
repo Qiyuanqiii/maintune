@@ -173,7 +173,8 @@ def sandbox_observation_type():
 class OpenHandsRuntime:
     """OpenHands loop with only controller-provided SandboxProvider tools."""
 
-    async def run(self, *, base_url: str, api_key: str, model: str, system: str, prompt: str, sandbox_provider, sandbox_id: str, model_timeout: int, tool_timeout: int, task_timeout: int, soft_step_limit: int, hard_step_limit: int, step_extension: int, loop_threshold: int, parameters: dict | None = None) -> RuntimeResult:
+    async def run(self, *, base_url: str, api_key: str, model: str, system: str, prompt: str, sandbox_provider, sandbox_id: str, model_timeout: int, tool_timeout: int, task_timeout: int, soft_step_limit: int, hard_step_limit: int, step_extension: int, loop_threshold: int, parameters: dict | None = None, plugin_tools: list[dict] | None = None, plugin_manager=None) -> RuntimeResult:
+        core_loop = asyncio.get_running_loop()
         return await agent_task(
             asyncio.to_thread(
                 self._run_sync,
@@ -191,16 +192,20 @@ class OpenHandsRuntime:
                 step_extension,
                 loop_threshold,
                 parameters or {},
+                plugin_tools or [],
+                plugin_manager,
+                core_loop,
             ),
             task_timeout,
         )
 
     @staticmethod
-    def _run_sync(base_url, api_key, model, system, prompt, sandbox_provider, sandbox_id, model_timeout, tool_timeout, soft_step_limit, hard_step_limit, step_extension, loop_threshold, parameters):
+    def _run_sync(base_url, api_key, model, system, prompt, sandbox_provider, sandbox_id, model_timeout, tool_timeout, soft_step_limit, hard_step_limit, step_extension, loop_threshold, parameters, plugin_tools, plugin_manager, core_loop):
         from openhands.sdk import Action, Agent, LLM, LocalConversation, Tool, ToolDefinition
         from openhands.sdk.conversation import get_agent_final_response
         from openhands.sdk.tool import ToolExecutor
         from openhands.sdk.tool.registry import register_tool
+        from pydantic import create_model
 
         calls: list[dict] = []
         budget = StepBudgetController(soft_step_limit, hard_step_limit, step_extension, loop_threshold)
@@ -233,6 +238,17 @@ class OpenHandsRuntime:
                         text = f"exit_code={result['exit_code']}\n{result['output']}"
                     elif self.kind == "read_file":
                         text = asyncio.run(tool_call(sandbox_provider.read_file(sandbox_id, action.path), tool_timeout))
+                    elif self.kind.startswith("plugin:"):
+                        if plugin_manager is None:
+                            raise RuntimeError("Plugin manager is unavailable")
+                        identifier = self.kind.removeprefix("plugin:")
+                        future = asyncio.run_coroutine_threadsafe(plugin_manager.invoke_tool(identifier, action.model_dump()), core_loop)
+                        try:
+                            plugin_result = future.result(timeout=tool_timeout)
+                        except Exception:
+                            future.cancel()
+                            raise
+                        text = plugin_result if isinstance(plugin_result, str) else json.dumps(plugin_result, ensure_ascii=False)
                     else:
                         asyncio.run(tool_call(sandbox_provider.write_file(sandbox_id, action.path, action.content), tool_timeout)); text = "written"
                     return SandboxObservation.from_text(text[:100_000])
@@ -259,6 +275,27 @@ class OpenHandsRuntime:
         register_tool(ReadTool.name, ReadTool)
         register_tool(WriteTool.name, WriteTool)
         tools = [Tool(name=ShellTool.name), Tool(name=ReadTool.name), Tool(name=WriteTool.name)]
+        primitive_types = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+        for registration in plugin_tools:
+            identifier = registration["identifier"]
+            schema = registration["input_schema"]
+            fields = {}
+            for field_name, field_schema in schema.get("properties", {}).items():
+                python_type = primitive_types[field_schema["type"]]
+                default = ... if field_name in schema.get("required", []) else field_schema.get("default", None)
+                fields[field_name] = (python_type, Field(default=default, description=field_schema.get("description", "")))
+            action_class = create_model("PluginAction_" + hashlib.sha256(identifier.encode()).hexdigest()[:12], __base__=Action, **fields)
+            def make_tool(plugin_identifier, plugin_action, plugin_description):
+                class PluginTool(ToolDefinition[plugin_action, SandboxObservation]):
+                    @classmethod
+                    def create(cls, conv_state, **params):
+                        return [cls(description=plugin_description, action_type=plugin_action, observation_type=SandboxObservation, executor=Executor("plugin:" + plugin_identifier))]
+                return PluginTool
+            PluginTool = make_tool(identifier, action_class, registration["description"])
+            tool_name = "maintune_plugin_" + hashlib.sha256(identifier.encode()).hexdigest()[:16]
+            PluginTool.name = tool_name
+            register_tool(tool_name, PluginTool)
+            tools.append(Tool(name=tool_name))
         llm_parameters = dict(parameters)
         temperature = llm_parameters.pop("temperature", None)
         top_p = llm_parameters.pop("top_p", None)

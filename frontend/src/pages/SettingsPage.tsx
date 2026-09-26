@@ -11,6 +11,7 @@ export function SettingsPage({ c }: { c: ConsoleState }) {
     setNotice,
     busy,
     providers,
+    plugins,
     runtimeConfigs,
     settings,
     setSettings,
@@ -158,11 +159,14 @@ export function SettingsPage({ c }: { c: ConsoleState }) {
                 >
                   <option value="local">{t("sandbox.localOption")}</option>
                   <option value="shipyard">{t("sandbox.shipyardOption")}</option>
+                  {plugins.flatMap((plugin) => plugin.registrations
+                    .filter((registration) => registration.kind === "provider" && registration.metadata.provider_kind === "sandbox")
+                    .map((registration) => <option key={registration.identifier} value={registration.identifier}>{plugin.name} · {registration.name}</option>))}
                 </select>
               </Field>
               {sandbox.provider === "local" ? (
                 <div className="info">{t("sandbox.localInfo")}</div>
-              ) : (
+              ) : sandbox.provider === "shipyard" ? (
                 <>
                   <Field title="Base URL">
                     <input
@@ -197,7 +201,7 @@ export function SettingsPage({ c }: { c: ConsoleState }) {
                     />
                   </Field>
                 </>
-              )}
+              ) : <div className="info">{t("sandbox.pluginInfo")}</div>}
               <div className="actions">
                 <button disabled={busy} className="primary">
                   {t("sandbox.save")}

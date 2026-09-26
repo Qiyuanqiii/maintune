@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 
@@ -26,8 +28,10 @@ from .db import Config, Repository, Task, Timeline
 from .policy import owner_action
 
 
-PLUGIN_API_VERSION = 1
+PLUGIN_API_VERSION = 2
+LEGACY_PLUGIN_API_VERSION = 1
 PLUGIN_PROTOCOL = "maintune.plugin.v1"
+PLUGIN_PROTOCOL_V2 = "maintune.plugin.v2"
 MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_UNPACKED_BYTES = 50 * 1024 * 1024
 MAX_ARCHIVE_FILES = 512
@@ -74,6 +78,55 @@ class PluginEntrypoint(BaseModel):
 class MaintuneCompatibility(BaseModel):
     model_config = ConfigDict(extra="forbid")
     min_version: str = Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+    max_version: str | None = Field(default=None, pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+class PluginRuntimeSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    default: Literal["isolated", "in_process"] = "isolated"
+    supported: list[Literal["isolated", "in_process"]] = Field(default_factory=lambda: ["isolated"], min_length=1, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_modes(self):
+        if len(set(self.supported)) != len(self.supported) or self.default not in self.supported:
+            raise ValueError("runtime default must be included in unique supported modes")
+        return self
+
+
+class PluginPythonSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dependencies: str | None = Field(default=None, max_length=200)
+
+    @field_validator("dependencies")
+    @classmethod
+    def valid_dependency_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        path = PurePosixPath(value)
+        if path.is_absolute() or "\\" in value or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("Python dependency path must stay inside the plugin package")
+        return value
+
+
+class PluginDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9.-]{2,127}$")
+    version: str = Field(default="*", max_length=80)
+    requirement: Literal["required", "optional"] = "required"
+
+
+class PluginUISpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["bundled", "iframe"]
+    entrypoint: str = Field(min_length=1, max_length=200)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def valid_ui_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or "\\" in value or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("UI entrypoint must stay inside the plugin package")
+        return value
 
 
 class PluginManifest(BaseModel):
@@ -81,7 +134,8 @@ class PluginManifest(BaseModel):
     id: str
     name: str = Field(min_length=1, max_length=100)
     version: str
-    api_version: int = Field(ge=1, le=1000)
+    plugin_api: int = Field(ge=1, le=2)
+    api_version: int | None = Field(default=None, ge=1, le=1)
     publisher: str = Field(min_length=1, max_length=100)
     license: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9 .+()/-]{0,99}$")
     description: str = Field(default="", max_length=500)
@@ -89,6 +143,36 @@ class PluginManifest(BaseModel):
     capabilities: list[Literal["repository.read", "task.read", "event.subscribe", "owner_decision.submit", "plugin.log", "plugin.health"]] = Field(default_factory=list, max_length=32)
     entrypoint: PluginEntrypoint
     config: dict[str, PluginConfigField] = Field(default_factory=dict)
+    runtime: PluginRuntimeSpec = Field(default_factory=PluginRuntimeSpec)
+    python: PluginPythonSpec = Field(default_factory=PluginPythonSpec)
+    dependencies: list[PluginDependency] = Field(default_factory=list, max_length=64)
+    config_schema: dict[str, Any] | None = None
+    ui: PluginUISpec | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_api_version(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            if "plugin_api" not in value:
+                value["plugin_api"] = value.get("api_version", LEGACY_PLUGIN_API_VERSION)
+        return value
+
+    @model_validator(mode="after")
+    def validate_api_shape(self):
+        if self.api_version is not None and self.api_version != self.plugin_api:
+            raise ValueError("api_version and plugin_api disagree")
+        if self.plugin_api == 1:
+            if self.api_version not in (None, 1):
+                raise ValueError("Legacy API version must be 1")
+        elif self.capabilities:
+            raise ValueError("Plugin API v2 registers extensions at runtime; manifest capabilities are not supported")
+        if len({item.id for item in self.dependencies}) != len(self.dependencies):
+            raise ValueError("duplicate Maintune plugin dependency")
+        if self.config_schema is not None:
+            from .plugin_api_v2 import validate_config_schema
+            validate_config_schema(self.config_schema)
+        return self
 
     @field_validator("id")
     @classmethod
@@ -110,6 +194,10 @@ class PluginManifest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("duplicate capability")
         return value
+
+    @property
+    def is_legacy(self) -> bool:
+        return self.plugin_api == LEGACY_PLUGIN_API_VERSION
 
 
 class PluginEvent(BaseModel):
@@ -225,6 +313,10 @@ def _safe_member(info: zipfile.ZipInfo) -> PurePosixPath:
     path = PurePosixPath(info.filename)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise PluginPackageError("Archive contains an unsafe path")
+    reserved = {"con", "prn", "aux", "nul", *(f"com{index}" for index in range(1, 10)), *(f"lpt{index}" for index in range(1, 10))}
+    for part in path.parts:
+        if ":" in part or part.endswith((" ", ".")) or part.split(".", 1)[0].casefold() in reserved:
+            raise PluginPackageError("Archive contains an unsafe path")
     mode = info.external_attr >> 16
     if stat.S_ISLNK(mode):
         raise PluginPackageError("Archive symlinks are forbidden")
@@ -253,19 +345,19 @@ class PluginPackageManager:
                     raise PluginPackageError("Plugin package has too many files")
                 total = 0
                 seen: set[str] = set()
+                seen_folded: set[str] = set()
                 for info in infos:
                     path = _safe_member(info)
                     normalized = path.as_posix()
-                    if normalized in seen:
+                    if normalized in seen or normalized.casefold() in seen_folded:
                         raise PluginPackageError("Plugin package contains duplicate paths")
                     seen.add(normalized)
+                    seen_folded.add(normalized.casefold())
                     total += info.file_size
                     if total > MAX_UNPACKED_BYTES:
                         raise PluginPackageError("Plugin package expands beyond the size limit")
                 if "manifest.yaml" not in seen:
                     raise PluginPackageError("Plugin package is missing manifest.yaml")
-                if "requirements.lock" not in seen:
-                    raise PluginPackageError("Plugin package is missing requirements.lock")
                 if not any(name.startswith("src/") and not name.endswith("/") for name in seen):
                     raise PluginPackageError("Plugin package is missing source files")
                 manifest_bytes = package.read("manifest.yaml")
@@ -275,32 +367,59 @@ class PluginPackageManager:
             raise PluginPackageError("Manifest is too large")
         try:
             manifest_data = parse_manifest_yaml(manifest_bytes.decode("utf-8"))
+            if manifest_data.get("api_version") not in (None, LEGACY_PLUGIN_API_VERSION):
+                raise PluginPackageError("Unsupported Plugin API version")
+            if manifest_data.get("plugin_api", LEGACY_PLUGIN_API_VERSION) not in (LEGACY_PLUGIN_API_VERSION, PLUGIN_API_VERSION):
+                raise PluginPackageError("Unsupported Plugin API version")
             manifest = PluginManifest.model_validate(manifest_data)
         except Exception as error:
             if isinstance(error, PluginPackageError):
                 raise
             raise PluginPackageError("Manifest schema validation failed") from error
-        if manifest.api_version != PLUGIN_API_VERSION:
+        if manifest.plugin_api not in (LEGACY_PLUGIN_API_VERSION, PLUGIN_API_VERSION):
             raise PluginPackageError("Unsupported Plugin API version")
-        if self._version_tuple(manifest.maintune.min_version) > self._version_tuple(self.maintune_version):
+        if manifest.is_legacy and "requirements.lock" not in seen:
+            raise PluginPackageError("Plugin API v1 package is missing requirements.lock")
+        dependencies = manifest.python.dependencies
+        if dependencies and dependencies not in seen:
+            raise PluginPackageError("Plugin Python dependency file is missing")
+        if manifest.ui and manifest.ui.entrypoint not in seen:
+            raise PluginPackageError("Plugin UI entrypoint is missing")
+        if any(PurePosixPath(name).name.casefold() in {"install.py", "setup.sh", "post_install.py"} for name in seen):
+            raise PluginPackageError("Custom plugin installation scripts are not supported")
+        # A bare floor such as 0.1.0 historically admitted Preview builds of
+        # that release. Keep that contract while comparing explicit Preview
+        # numbers accurately (preview.4 must not run on preview.3).
+        minimum = manifest.maintune.min_version
+        if re.fullmatch(r"\d+\.\d+\.\d+", minimum):
+            minimum += ".dev0"
+        if self._version_tuple(minimum) > self._version_tuple(self.maintune_version):
             raise PluginPackageError("Plugin requires a newer Maintune version")
+        if manifest.maintune.max_version and self._version_tuple(manifest.maintune.max_version) < self._version_tuple(self.maintune_version):
+            raise PluginPackageError("Plugin does not support this Maintune version")
         module_path = "src/" + manifest.entrypoint.python.replace(".", "/") + ".py"
-        package_path = "src/" + manifest.entrypoint.python.replace(".", "/") + "/__main__.py"
-        if module_path not in seen and package_path not in seen:
+        package_init = "src/" + manifest.entrypoint.python.replace(".", "/") + "/__init__.py"
+        package_main = "src/" + manifest.entrypoint.python.replace(".", "/") + "/__main__.py"
+        if module_path not in seen and package_init not in seen and package_main not in seen:
             raise PluginPackageError("Plugin entrypoint is missing")
         return manifest
 
     @staticmethod
-    def _version_tuple(value: str) -> tuple[int, int, int]:
-        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value)
-        return tuple(map(int, match.groups())) if match else (0, 0, 0)
+    def _version_tuple(value: str) -> Version:
+        try:
+            return Version(value)
+        except InvalidVersion as error:
+            raise PluginPackageError("Invalid Maintune compatibility version") from error
 
-    def install(self, archive: Path) -> PluginManifest:
+    def install(self, archive: Path, *, replace: bool = False) -> PluginManifest:
         manifest = self.validate(archive)
         destination = self.installed / manifest.id
-        if destination.exists():
+        if destination.exists() and not replace:
             raise PluginPackageError("Plugin id is already installed")
+        if replace and not destination.is_dir():
+            raise PluginPackageError("Plugin is not installed")
         staging = Path(tempfile.mkdtemp(prefix="install-", dir=self.runtime))
+        previous: Path | None = None
         try:
             with zipfile.ZipFile(archive) as package:
                 for info in package.infolist():
@@ -314,10 +433,22 @@ class PluginPackageManager:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         with package.open(info) as source, target.open("wb") as output:
                             shutil.copyfileobj(source, output)
-            os.replace(staging, destination)
+            if replace:
+                previous = self.runtime / f"upgrade-old-{uuid.uuid4().hex}"
+                os.replace(destination, previous)
+            try:
+                os.replace(staging, destination)
+            except Exception:
+                if previous and previous.is_dir():
+                    os.replace(previous, destination)
+                    previous = None
+                raise
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+        finally:
+            if previous and previous.is_dir() and destination.is_dir() and previous.parent.resolve() == self.runtime.resolve():
+                shutil.rmtree(previous)
         return manifest
 
     def uninstall(self, plugin_id: str) -> None:
@@ -358,11 +489,13 @@ class PluginProcess:
         self.stderr_tail = ""
         self.write_lock = asyncio.Lock()
         self.started_at: float | None = None
+        self.registrations: list[dict[str, Any]] = []
+        self._secret_values: tuple[str, ...] = ()
 
     def _python(self) -> Path:
         return self.runtime_dir / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
-    async def start(self, timeout: float = 10) -> None:
+    async def start(self, timeout: float = 10, context: dict[str, Any] | None = None) -> None:
         if self.process and self.process.returncode is None:
             return
         python = self._python()
@@ -370,7 +503,23 @@ class PluginProcess:
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(venv.EnvBuilder(with_pip=True, clear=False).create, self.runtime_dir / "venv")
         await self._install_locked_requirements(python)
-        bootstrap = "import runpy,sys;sys.path.insert(0,sys.argv[1]);runpy.run_module(sys.argv[2],run_name='__main__')"
+        if self.manifest.is_legacy:
+            bootstrap = "import runpy,sys;sys.path.insert(0,sys.argv[1]);runpy.run_module(sys.argv[2],run_name='__main__')"
+            arguments = (str(self.plugin_dir / "src"), self.manifest.entrypoint.python)
+            start_params: dict[str, Any] = {"api_version": 1}
+        else:
+            sdk_root = self.runtime_dir / "sdk"
+            await asyncio.to_thread(self._stage_sdk, sdk_root)
+            bootstrap = "import sys;sys.path.insert(0,sys.argv[1]);sys.path.insert(0,sys.argv[2]);from maintune_plugin_sdk.runner import run_stdio;run_stdio()"
+            arguments = (str(sdk_root), str(self.plugin_dir / "src"))
+            start_context = context or {}
+            self._secret_values = tuple(str(value) for name, value in (start_context.get("config") or {}).items() if name in start_context.get("secret_fields", ()) and value)
+            start_params = {
+                "protocol": PLUGIN_PROTOCOL_V2,
+                "plugin_src": str(self.plugin_dir / "src"),
+                "entrypoint": self.manifest.entrypoint.python,
+                "context": start_context,
+            }
         child_env = {
             key: value
             for key, value in os.environ.items()
@@ -378,7 +527,7 @@ class PluginProcess:
         }
         child_env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
         self.process = await asyncio.create_subprocess_exec(
-            str(python), "-I", "-c", bootstrap, str(self.plugin_dir / "src"), self.manifest.entrypoint.python,
+            str(python), "-I", "-u", "-c", bootstrap, *arguments,
             cwd=self.plugin_dir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -389,29 +538,58 @@ class PluginProcess:
         self.stderr_task = asyncio.create_task(self._stderr())
         self.started_at = time.time()
         try:
-            await asyncio.wait_for(self.request("lifecycle.start", {"api_version": 1}), timeout)
+            result = await asyncio.wait_for(self.request("lifecycle.start", start_params), timeout)
+            if not self.manifest.is_legacy:
+                if not isinstance(result, dict) or result.get("protocol") != PLUGIN_PROTOCOL_V2 or not isinstance(result.get("registrations"), list):
+                    raise PluginError("Plugin API v2 registration response is invalid")
+                self.registrations = result["registrations"]
         except Exception:
-            detail = re.sub(r"(?i)(token|password|secret|authorization)\s*[:=]\s*\S+", r"\1=[REDACTED]", self.stderr_tail).strip()
+            detail = self._sanitize(self.stderr_tail).strip()
             await self.stop()
             raise PluginError("Plugin failed to start" + (f": {detail[-500:]}" if detail else ""))
 
+    @staticmethod
+    def _stage_sdk(destination: Path) -> None:
+        try:
+            import maintune_plugin_sdk
+            source = Path(maintune_plugin_sdk.__file__).resolve().parent
+        except ModuleNotFoundError:
+            # Editable development environments created before the SDK was
+            # added may not expose it until the next editable install.
+            source = Path(__file__).resolve().parents[2] / "sdk" / "maintune_plugin_sdk"
+            if not (source / "runner.py").is_file():
+                raise PluginError("Maintune Plugin SDK is not installed")
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination / "maintune_plugin_sdk", dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+    def _sanitize(self, message: str) -> str:
+        message = re.sub(r"(?i)(token|password|secret|authorization)\s*[:=]\s*\S+", r"\1=[REDACTED]", message)
+        for secret in self._secret_values:
+            message = message.replace(secret, "[REDACTED]")
+        return message
+
     async def _install_locked_requirements(self, python: Path) -> None:
-        requirements = self.plugin_dir / "requirements.lock"
+        dependency_file = "requirements.lock" if self.manifest.is_legacy else self.manifest.python.dependencies
+        if not dependency_file:
+            return
+        requirements = self.plugin_dir / dependency_file
         content = requirements.read_text(encoding="utf-8")
         effective = [line.strip() for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")]
         digest = hashlib.sha256(content.encode()).hexdigest()
         marker = self.runtime_dir / "requirements.sha256"
         if marker.is_file() and marker.read_text(encoding="ascii").strip() == digest:
             return
-        for line in effective:
-            lowered = line.lower()
-            if any(value in lowered for value in ("git+", "file:", "-e ", "--editable", "--index-url", "--extra-index-url")):
-                raise PluginError("Plugin dependency lock contains a forbidden source")
-            if "==" not in line or "--hash=sha256:" not in line:
-                raise PluginError("Plugin dependencies must be pinned with SHA-256 hashes")
+        if self.manifest.is_legacy:
+            for line in effective:
+                lowered = line.lower()
+                if any(value in lowered for value in ("git+", "file:", "-e ", "--editable", "--index-url", "--extra-index-url")):
+                    raise PluginError("Plugin dependency lock contains a forbidden source")
+                if "==" not in line or "--hash=sha256:" not in line:
+                    raise PluginError("Plugin dependencies must be pinned with SHA-256 hashes")
         if effective:
+            options = ["--require-hashes", "--no-deps"] if self.manifest.is_legacy else []
             process = await asyncio.create_subprocess_exec(
-                str(python), "-I", "-m", "pip", "--disable-pip-version-check", "install", "--require-hashes", "--no-deps", "--requirement", str(requirements),
+                str(python), "-I", "-m", "pip", "--disable-pip-version-check", "install", *options, "--requirement", str(requirements),
                 cwd=self.plugin_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -425,7 +603,7 @@ class PluginProcess:
             if process.returncode:
                 message = output.decode("utf-8", "replace")
                 message = re.sub(r"https?://\S+", "[REDACTED URL]", message)
-                raise PluginError("Plugin dependency installation failed: " + message[-500:])
+                raise PluginError("Plugin dependency installation failed: " + self._sanitize(message)[-500:])
         marker.write_text(digest, encoding="ascii")
 
     async def stop(self) -> None:
@@ -492,7 +670,7 @@ class PluginProcess:
                     future = self.pending.get(str(message["id"]))
                     if future and not future.done():
                         if "error" in message:
-                            future.set_exception(PluginError(str(message["error"].get("message", "Plugin error"))))
+                            future.set_exception(PluginError(self._sanitize(str(message["error"].get("message", "Plugin error")))))
                         else:
                             future.set_result(message.get("result"))
         finally:
@@ -504,25 +682,177 @@ class PluginProcess:
     async def _handle_call(self, message: dict[str, Any]) -> None:
         identifier = str(message["id"])
         try:
-            if message.get("method") != "capability.call":
+            method = message.get("method")
+            if method not in {"capability.call", "core.call"} or (self.manifest.is_legacy and method != "capability.call"):
                 raise PluginCapabilityError("Unsupported plugin call")
             params = message.get("params") or {}
-            result = await self.capability_handler(str(params.get("capability", "")), params)
+            if not isinstance(params, dict):
+                raise PluginCapabilityError("Invalid plugin call parameters")
+            capability = str(params.get("capability", "")) if method == "capability.call" else str(params.get("method", ""))
+            result = await self.capability_handler(capability, params)
             await self._write({"jsonrpc": "2.0", "id": identifier, "result": result})
         except Exception as error:
-            await self._write({"jsonrpc": "2.0", "id": identifier, "error": {"code": "CAPABILITY_DENIED", "message": str(error)[:500]}})
+            await self._write({"jsonrpc": "2.0", "id": identifier, "error": {"code": "CAPABILITY_DENIED", "message": self._sanitize(str(error))[:500]}})
 
     async def _stderr(self) -> None:
         assert self.process and self.process.stderr
         while chunk := await self.process.stderr.read(1024):
             text = chunk.decode("utf-8", "replace")
-            text = re.sub(r"(?i)(token|password|secret|authorization)\s*[:=]\s*\S+", r"\1=[REDACTED]", text)
+            text = self._sanitize(text)
             self.stderr_tail = (self.stderr_tail + text)[-4096:]
 
     def state(self) -> str:
         if not self.process:
             return "stopped"
         return "running" if self.process.returncode is None else "error"
+
+
+class InProcessPlugin:
+    """Trusted, opt-in v2 runtime using the same public SDK registration API.
+
+    Python cannot safely kill a running thread. Stop therefore drains calls and
+    reports a timeout; operators may need to restart Core for a stuck plugin.
+    """
+
+    def __init__(self, manifest: PluginManifest, plugin_dir: Path, runtime_dir: Path, capability_handler: CapabilityHandler):
+        if manifest.is_legacy:
+            raise PluginError("Legacy plugins only support isolated runtime")
+        self.manifest, self.plugin_dir, self.runtime_dir = manifest, plugin_dir, runtime_dir
+        self.capability_handler = capability_handler
+        self.registrations: list[dict[str, Any]] = []
+        self.api = None
+        self.context = None
+        self.module = None
+        self.active: set[asyncio.Task] = set()
+        self.calls: dict[str, Any] = {}
+        self.running = False
+        self.draining = False
+
+    async def start(self, timeout: float = 10, context: dict[str, Any] | None = None) -> None:
+        if self.running:
+            return
+        try:
+            import maintune_plugin_sdk  # noqa: F401
+        except ModuleNotFoundError:
+            source_sdk = Path(__file__).resolve().parents[2] / "sdk"
+            if not (source_sdk / "maintune_plugin_sdk" / "api.py").is_file():
+                raise PluginError("Maintune Plugin SDK is not installed")
+            sys.path.insert(0, str(source_sdk))
+        from maintune_plugin_sdk import PluginAPI, PluginContext
+
+        source = self.plugin_dir / "src"
+        relative = Path(*self.manifest.entrypoint.python.split("."))
+        candidate = source / relative.with_suffix(".py")
+        package = source / relative / "__init__.py"
+        path = candidate if candidate.is_file() else package
+        if not path.is_file():
+            raise PluginError("Plugin entrypoint is missing")
+        unique = "_maintune_plugin_" + hashlib.sha256(f"{self.manifest.id}:{self.manifest.version}".encode()).hexdigest()[:16]
+        spec = importlib.util.spec_from_file_location(unique, path, submodule_search_locations=[str(path.parent)] if path == package else None)
+        if not spec or not spec.loader:
+            raise PluginError("Plugin entrypoint cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[unique] = module
+        try:
+            await asyncio.wait_for(asyncio.to_thread(spec.loader.exec_module, module), timeout)
+            register = getattr(module, "register", None)
+            if not callable(register):
+                raise PluginError("Plugin entrypoint must define register(api)")
+            api = PluginAPI()
+            result = register(api)
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout)
+            self.api = api
+            self.module = module
+            config = context or {}
+            data_dir = Path(config.get("data_dir") or self.runtime_dir / "data")
+            data_dir.mkdir(parents=True, exist_ok=True)
+            async def core_call(method: str, params: dict[str, Any]):
+                return await self.capability_handler(method, {"params": params})
+            self.context = PluginContext(
+                plugin_id=self.manifest.id,
+                plugin_version=self.manifest.version,
+                data_dir=data_dir,
+                config=config.get("config") or {},
+                _core_call=core_call,
+            )
+            self.registrations = api.registrations()
+            self.running = True
+            self.draining = False
+        except Exception:
+            sys.modules.pop(unique, None)
+            raise
+
+    async def request(self, method: str, params: dict[str, Any], timeout: float = 10) -> Any:
+        if not self.running or self.draining:
+            raise PluginError("Plugin is not running")
+        if method == "health":
+            return {"ok": True, "protocol": PLUGIN_PROTOCOL_V2}
+        if method == "config.migrate":
+            previous = params.get("old_config") or {}
+            if not isinstance(previous, dict):
+                raise PluginError("Previous plugin config must be an object")
+            migrate = getattr(self.module, "migrate_config", None)
+            result = migrate(previous, str(params.get("old_version", "")), str(params.get("new_version", ""))) if callable(migrate) else previous
+            if asyncio.iscoroutine(result):
+                result = await asyncio.wait_for(result, timeout)
+            if not isinstance(result, dict):
+                raise PluginError("Plugin config migration must return an object")
+            return result
+        if method == "lifecycle.upgrade":
+            upgrade = getattr(self.module, "on_upgrade", None)
+            if callable(upgrade):
+                result = upgrade(self.context, str(params.get("old_version", "")), str(params.get("new_version", "")))
+                if asyncio.iscoroutine(result):
+                    await asyncio.wait_for(result, timeout)
+            return {"upgraded": True}
+        if method != "extension.invoke" or not self.api or not self.context:
+            raise PluginError("Unsupported in-process Plugin API method")
+        from maintune_plugin_sdk import PluginContext
+
+        invocation_id = str(params.get("invocation_id", ""))
+        context = PluginContext(
+            plugin_id=self.context.plugin_id,
+            plugin_version=self.context.plugin_version,
+            data_dir=self.context.data_dir,
+            config=self.context.config,
+            invocation_id=invocation_id,
+            _core_call=self.context._core_call,
+        )
+        async def invoke():
+            return await self.api.invoke(str(params.get("kind")), str(params.get("name")), context, params.get("input") or {})
+        task = asyncio.create_task(invoke())
+        self.active.add(task)
+        self.calls[invocation_id] = context
+        try:
+            return await asyncio.wait_for(task, timeout)
+        finally:
+            self.active.discard(task)
+            self.calls.pop(invocation_id, None)
+
+    async def notify(self, method: str, params: dict[str, Any]) -> None:
+        if method == "extension.cancel":
+            context = self.calls.get(str(params.get("invocation_id", "")))
+            if context:
+                context._cancelled.set()
+
+    async def stop(self) -> None:
+        if not self.running:
+            return
+        self.draining = True
+        if self.active:
+            _, pending = await asyncio.wait(self.active, timeout=5)
+            if pending:
+                raise PluginError("In-process plugin did not drain; Core restart may be required")
+        stop = getattr(self.module, "stop", None)
+        if callable(stop):
+            result = stop(self.context)
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, 5)
+        self.running = False
+
+    def state(self) -> str:
+        return "running" if self.running and not self.draining else "stopped"
 
 
 class PluginCapabilityBroker:

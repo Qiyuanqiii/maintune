@@ -48,7 +48,7 @@ export type ResolvedRuntime = {
   model_timeout: number; tool_timeout: number; task_timeout: number; sandbox_ttl: number;
 };
 export type Provider = {
-  id: string; name: string; type: "openai-compatible"; base_url: string; models: ModelDefinition[];
+  id: string; name: string; type: "openai-compatible" | "plugin"; base_url: string; plugin_provider?: string | null; available?: boolean; models: ModelDefinition[];
   has_key: boolean; api_key_masked: string;
 };
 export type Agent = {
@@ -59,7 +59,7 @@ export type Settings = {
   model: ModelRef; system_prompt: string; reasoning: ReasoningOverride; generation: GenerationConfig;
   steps: StepConfig; timeouts: TimeoutConfig;
 };
-export type Sandbox = { provider: "local" | "shipyard"; base_url: string; profile: string; has_key: boolean; api_key_masked: string };
+export type Sandbox = { provider: string; base_url: string; profile: string; has_key: boolean; api_key_masked: string };
 export type Run = { id: string; started: number; ended: number | null; status: string; agent: string; model: string; result?: string; error?: string; usage_reported?: boolean; trigger: string; runtime_config?: ResolvedRuntime };
 export type Dashboard = {
   tokens: Record<string, { total: number; input: number; output: number; reasoning: number; cached: number; models: Record<string, number> }>;
@@ -82,13 +82,16 @@ export type Task = {
   triage?: { classification?: string; risk?: string; reason?: string; affected_components?: string[] };
   pull_url?: string; timeline?: { timestamp: number; kind: string; data: Record<string, unknown> }[];
 };
-export type PluginConfigField = { type: "string" | "boolean" | "integer" | "select" | "string_list" | "secret"; title: string; description: string; required: boolean; default: unknown; options: string[] };
+export type PluginConfigField = { type: "string" | "boolean" | "integer" | "number" | "select" | "string_list" | "secret" | "json"; title: string; description: string; required: boolean; default: unknown; options: string[] };
+export type PluginRegistration = { kind: "hook" | "tool" | "service" | "provider" | "route"; name: string; identifier: string; metadata: Record<string, unknown> };
 export type Plugin = {
   id: string; name: string; version: string; publisher: string; license: string; description: string; api_version: number;
   capabilities: string[]; config_schema: Record<string, PluginConfigField>; config: Record<string, unknown>;
   enabled: boolean; runtime_status: "running" | "stopped" | "error"; error: string;
   connection_status: "connected" | "disconnected"; connected_instance: string; last_heartbeat: number | null;
   event_subscriptions: string[]; has_readme: boolean;
+  has_ui: boolean; ui_entrypoint: string | null;
+  registrations: PluginRegistration[]; runtime_mode: "isolated" | "in_process"; runtime_supported: ("isolated" | "in_process")[];
 };
 
 export const emptyCapabilities = (): ModelCapabilities => ({

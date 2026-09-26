@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-preview.3 - Plugin API v2 candidate
+
+- 新增独立 Plugin SDK、v2 `.mtp` 扩展点、Service、Tool、Model/Sandbox Provider 与插件自带 UI；保留 v1 Legacy 加载路径。
+- 新增插件配置迁移和任务 Hook；Plugin API 仍为 Experimental，Agent Tool 当前仅接入 `code_worker`。
+- 修复候选版的嵌套 Secret 声明风险，并将 Preview 3 历史与正式发布的 Preview 2 基线对齐。
+
 ## 0.1.0-preview.2 - Plugin API v1
 
 - 新增进程外 Plugin API v1，以及经过校验的本地 `.mtp` 插件包安装流程。

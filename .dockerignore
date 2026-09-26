@@ -3,6 +3,8 @@
 !pyproject.toml
 !backend/
 !backend/**
+!sdk/
+!sdk/**
 !frontend/
 !frontend/dist/
 !frontend/dist/**

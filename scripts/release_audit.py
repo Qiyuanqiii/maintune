@@ -1,6 +1,6 @@
 """Fail-closed release scan without printing credential values.
 
-Scans files that Git would include and every reachable commit. Findings contain
+Scans tracked release source and every reachable commit. Findings contain
 only a category, path and optional commit id; matched content is never printed.
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ def scan_bytes(path: str, data: bytes, source: str, findings: set[tuple[str, str
 
 
 def current_files() -> list[str]:
-    output = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", binary=True)
+    output = git("ls-files", "--cached", "-z", binary=True)
     return [item.decode("utf-8", "surrogateescape") for item in output.split(b"\0") if item]
 
 

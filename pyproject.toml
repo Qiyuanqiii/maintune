@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maintune"
-version = "0.1.0-preview.2"
+version = "0.1.0-preview.3"
 description = "A self-hosted autonomous maintainer for GitHub."
 requires-python = ">=3.12"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic-settings>=2.7,<3",
   "PyJWT[crypto]>=2.10,<3",
+  "packaging>=24,<27",
   "openhands-sdk==1.47.0",
 ]
 license = "AGPL-3.0-only"
@@ -27,7 +28,7 @@ Repository = "https://github.com/mcxianyujun/maintune"
 dev = ["pytest>=8,<10"]
 
 [tool.setuptools.packages.find]
-where = ["backend"]
+where = ["backend", "sdk"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

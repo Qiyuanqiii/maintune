@@ -59,7 +59,8 @@ def test_public_frontend_assets_are_not_captured_by_api_auth(client):
 
 def test_health_reports_release_and_schema(client):
     result = client.get("/healthz").json()
-    assert result == {"status": "ok", "version": "0.1.0-preview.2", "schema": 4}
+    assert result == {"status": "ok", "version": "0.1.0-preview.3", "schema": 4}
+    assert client.get("/api/capabilities").json()["plugins"] is True
 
 
 def test_setup_status_is_computed_and_diagnostics_complete(client, app, monkeypatch):

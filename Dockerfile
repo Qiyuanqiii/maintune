@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-ARG APP_VERSION=0.1.0-preview.2
+ARG APP_VERSION=0.1.0-preview.3
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
@@ -17,7 +17,9 @@ RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.lock 
     && useradd --uid 10001 --create-home maintainer
 COPY pyproject.toml ./
 COPY backend ./backend
+COPY sdk ./sdk
 RUN pip install --no-cache-dir --no-deps .
+RUN python -c "import maintune_plugin_sdk; print('Plugin SDK import: OK')"
 RUN pip check
 COPY --chown=maintainer:maintainer frontend/dist ./frontend/dist
 RUN chmod -R a+rX /app/frontend/dist

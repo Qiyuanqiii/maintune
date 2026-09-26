@@ -121,6 +121,19 @@ def test_manifest_parser_and_schema(tmp_path):
     assert parse_manifest_yaml(MANIFEST)["maintune"]["min_version"] == "0.1.0"
 
 
+def test_prerelease_compatibility_respects_preview_number(tmp_path):
+    archive = tmp_path / "version.mtp"
+    manager = PluginPackageManager(tmp_path / "plugins", "0.1.0-preview.3")
+    package(archive, MANIFEST)
+    assert manager.validate(archive).id == "official.test-plugin"
+    package(archive, MANIFEST.replace("min_version: 0.1.0", "min_version: 0.1.0-preview.4"))
+    with pytest.raises(PluginPackageError, match="newer Maintune"):
+        manager.validate(archive)
+    package(archive, MANIFEST.replace("min_version: 0.1.0", "min_version: 0.1.0-preview.2\n  max_version: 0.1.0-preview.2"))
+    with pytest.raises(PluginPackageError, match="does not support"):
+        manager.validate(archive)
+
+
 @pytest.mark.parametrize("unsafe", ["../escape.py", "/absolute.py"])
 def test_package_rejects_path_traversal_and_unsafe_paths(tmp_path, unsafe):
     archive = tmp_path / "bad.mtp"
