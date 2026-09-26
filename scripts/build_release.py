@@ -28,7 +28,7 @@ EXCLUDED_SUFFIXES = {".whl", ".sqlite", ".sqlite3", ".db", ".log", ".pem", ".key
 
 def candidates() -> list[Path]:
     output = subprocess.check_output(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT
+        ["git", "ls-files", "--cached", "-z"], cwd=ROOT
     )
     result = []
     for raw in output.split(b"\0"):
