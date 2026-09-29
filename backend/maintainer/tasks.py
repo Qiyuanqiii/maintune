@@ -162,6 +162,7 @@ class TaskProcessor:
             with self.sessions() as db:
                 previous = list(db.scalars(select(Outbox).where(Outbox.task_id == task_id, Outbox.kind == kind)))
                 if any(item.action_key != action_key and (item.status in {"unknown", "executing", "reconciling"}
+                       or (item.status == "completed" and item.data.get("head_sha") == data.get("head_sha"))
                        or (item.status == "pending" and item.data.get("recovery"))) for item in previous):
                     raise RecoveryConflict("A previous review action requires reconciliation")
         row = self.reserve(task_id, kind, action_key, data)
@@ -212,7 +213,7 @@ class TaskProcessor:
                 raise RuntimeError("GitHub action was claimed concurrently")
         try:
             result = await perform()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             with self.sessions.begin() as db:
                 db.get(Outbox, row.id).status = "unknown"
                 self.event(db, task_id, "github_action_unknown", {"kind": kind})
@@ -561,6 +562,77 @@ class TaskProcessor:
         finally:
             await self.at_stage("sandbox_destroy", sandbox.destroy(sandbox_id))
 
+    async def resume_saved_review(self, task_id, github, installation_id, repo, number, repository, head_sha, pull, previous_findings, gate_data, owner_decision):
+        """Finish an interrupted review from its reserved request, never a new model verdict."""
+        with self.sessions() as db:
+            all_actions = list(db.scalars(select(Outbox).where(Outbox.task_id == task_id, Outbox.kind == "pr_review")))
+            if any(item.status in {"unknown", "executing", "reconciling"} for item in all_actions):
+                raise RecoveryConflict("A previous review action requires reconciliation")
+            actions = [item for item in all_actions if item.data.get("head_sha") == head_sha]
+            if not actions:
+                return False
+            if len(actions) != 1:
+                raise RecoveryConflict("Multiple review actions exist for this task; inspect them manually")
+            action = actions[0]
+            pending_without_write = action.status == "pending" and action.attempts == 0
+            authorized_retry = action.status == "pending" and action.data.get("recovery", {}).get("retry_authorized")
+            if action.status != "completed" and not (pending_without_write or authorized_retry):
+                return False
+            request = action.data.get("review_request")
+            if (not request or request.get("commit_id") != head_sha or action.data.get("head_sha") != head_sha
+                    or request.get("event") not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}
+                    or action.action_key != f"pr-review:{repo}:{number}:{head_sha}:{request['event']}"
+                    or pull.get("state") != "open" or pull.get("merged") or pull.get("draft")
+                    or not repository.get("enabled") or not repository.get("auto_review_prs")):
+                raise RecoveryConflict("Saved review no longer matches the current PR or repository policy")
+            owner_gate_pending = request["event"] != "REQUEST_CHANGES" and gate_data.get("owner_required") and not owner_decision
+            task = db.get(Task, task_id)
+            if task.data.get("installation_id", installation_id) != installation_id:
+                raise RecoveryConflict("Review installation changed")
+            event = next((item for item in db.scalars(select(Timeline).where(
+                Timeline.task_id == task_id, Timeline.kind == "pr_review_completed",
+                Timeline.timestamp <= action.created).order_by(Timeline.timestamp.desc()))
+                if item.data.get("head_sha") == head_sha), None)
+            if not event:
+                raise RecoveryConflict("Original review verdict is unavailable; do not regenerate it")
+            verdict = ReviewVerdict.model_validate({key: event.data[key] for key in ReviewVerdict.model_fields if key in event.data})
+            blocking = bool(verdict.blocking_issues) or verdict.verdict == "changes_required"
+            if (verdict.verdict == "owner_decision" or (request["event"] == "REQUEST_CHANGES") != blocking
+                    or not request.get("body", "").startswith(verdict.summary)):
+                raise RecoveryConflict("Saved review and original verdict disagree")
+            action_id, action_key, action_data = action.id, action.action_key, dict(action.data)
+            result = {"id": action.external_id, "html_url": action.external_url} if action.status == "completed" else None
+            if result is not None and not result["html_url"]:
+                raise RecoveryConflict("Completed review is missing its GitHub URL")
+        if owner_gate_pending:
+            with self.sessions.begin() as db:
+                self.event(db, task_id, "product_decision_required", gate_data)
+            self.change_status(task_id, "waiting_for_owner", summary="The existing review is recorded; current PR policy requires an owner decision.",
+                head_sha=head_sha, product_gate=gate_data)
+            return True
+        if result is None:
+            result = await self.at_stage("github_review", self.github_action(task_id, "pr_review", action_key, action_data,
+                lambda: github.review(installation_id, repo, number, head_sha, request["event"], request["body"], request["comments"])))
+        with self.sessions.begin() as db:
+            for finding in verdict.blocking_issues + verdict.suggestions:
+                fingerprint = hashlib.sha256(f"{finding.path}|{finding.issue_type}|{re.sub(r'\s+', ' ', finding.message).lower()}".encode()).hexdigest()
+                if not db.scalar(select(ReviewFinding).where(ReviewFinding.repository == repo, ReviewFinding.number == number,
+                        ReviewFinding.fingerprint == fingerprint)):
+                    db.add(ReviewFinding(task_id=task_id, repository=repo, number=number, fingerprint=fingerprint,
+                        head_sha=head_sha, data=finding.model_dump()))
+            if request["event"] != "REQUEST_CHANGES" and previous_findings:
+                fingerprints = {item["fingerprint"] for item in previous_findings}
+                for finding in db.scalars(select(ReviewFinding).where(ReviewFinding.repository == repo, ReviewFinding.number == number)):
+                    if finding.fingerprint in fingerprints:
+                        finding.data = {**finding.data, "resolved": True, "resolved_head_sha": head_sha, "resolved_task_id": task_id}
+                self.event(db, task_id, "review_findings_resolved", {"count": len(fingerprints), "fingerprints": sorted(fingerprints), "head_sha": head_sha})
+            self.event(db, task_id, "pr_review_resumed", {"action_id": action_id,
+                "head_sha": head_sha, "review_url": result.get("html_url")})
+        self.change_status(task_id, "waiting_for_contributor" if request["event"] == "REQUEST_CHANGES" else "reviewed",
+            summary=verdict.summary, review_event=request["event"], review_url=result.get("html_url"), head_sha=head_sha,
+            product_gate=gate_data if gate_data.get("owner_required") else None)
+        return True
+
     async def process_pull(self, task_id, github, installation_id, repo, number, repository):
         previous_head_sha = ""
         previous_findings = []
@@ -621,6 +693,11 @@ class TaskProcessor:
                 self.event(db, task_id, "owner_decision_deferred", {"action": "defer"})
             self.change_status(task_id, "waiting_for_owner", summary="Owner deferred review; no Reviewer was started.", head_sha=head_sha)
             return
+        gate = pull_triage_gate(pull.get("title", ""), pull.get("body", ""), [item.get("filename") for item in context["files"]])
+        gate_data = inherited_gate or {"classification": gate.classification, "risk": gate.risk, "reason": gate.reason,
+                                       "affected_components": list(gate.affected_components), "owner_required": gate.owner_required}
+        if await self.resume_saved_review(task_id, github, installation_id, repo, number, repository, head_sha, pull, previous_findings, gate_data, owner_decision):
+            return
         if len(context["files"]) >= 100 or len(context["commits"]) >= 100:
             self.change_status(task_id, "waiting_for_owner", summary="PR exceeds bounded review limits")
             return
@@ -637,8 +714,6 @@ class TaskProcessor:
                 self.change_status(task_id, "waiting_for_contributor", summary=analysis.summary, head_sha=head_sha)
                 return
         files = [{"filename": f.get("filename"), "patch": f.get("patch", ""), "status": f.get("status"), "additions": f.get("additions"), "deletions": f.get("deletions")} for f in context["files"]]
-        gate = pull_triage_gate(pull.get("title", ""), pull.get("body", ""), [item["filename"] for item in files])
-        gate_data = inherited_gate or {"classification": gate.classification, "risk": gate.risk, "reason": gate.reason, "affected_components": list(gate.affected_components), "owner_required": gate.owner_required}
         owner_gate_required = bool(gate_data.get("owner_required")) and not owner_decision
         if plugin_review_result and plugin_review_result.get("head_sha") != head_sha:
             with self.sessions.begin() as db:

@@ -11,9 +11,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from maintainer.api import create_app
-from maintainer.db import Outbox, Repository, Task, Timeline
+from maintainer.db import Outbox, Repository, ReviewFinding, Task, Timeline
 from maintainer.github import GitHubAppClient, GitHubError
 from maintainer.review_recovery import RecoveryConflict, RecoveryDecision, recover_review
+from maintainer.schemas import ReviewVerdict
 from maintainer.security import Settings
 
 HEAD = "a" * 40
@@ -26,6 +27,8 @@ class GitHub:
         self.head, self.rows, self.comments, self.writes = HEAD, [], [], []
         self.error = None
         self.pause = None
+        self.review_pause = None
+        self.title = "Fix calculator regression"
 
     def published(self, **changes):
         return {"id": 42, "html_url": "https://github.com/owner/repo/pull/5#pullrequestreview-42",
@@ -42,6 +45,26 @@ class GitHub:
 
     async def review_author(self):
         return "review-app[bot]"
+
+    async def pull_context(self, installation, repo, number, previous_head=""):
+        assert (installation, repo, number) == (7, "owner/repo", 5)
+        return {"pull": {"state": "open", "draft": False, "merged": False,
+                         "title": self.title, "body": "Repair the existing behavior",
+                         "user": {"login": "contributor"}, "base": {"ref": "main"},
+                         "head": {"sha": self.head, "ref": "fix/calculator", "repo": {"full_name": repo}}},
+                "files": [{"filename": "src/calculator.js", "patch": "@@ -1 +1 @@\n-old\n+new"}],
+                "commits": [{"sha": self.head}], "checks": {"check_runs": []},
+                "statuses": {"state": "success", "statuses": []}}
+
+    async def repository_guidance(self, installation, repo, branch):
+        return ""
+
+    async def review(self, installation, repo, number, head, event, body, comments):
+        assert (installation, repo, number, head) == (7, "owner/repo", 5, HEAD)
+        assert {"commit_id": head, "event": event, "body": body, "comments": comments} == PAYLOAD
+        if self.review_pause:
+            await self.review_pause()
+        return await self.publish()
 
     async def paginated(self, installation, path, **kwargs):
         assert installation == 7
@@ -80,12 +103,12 @@ def case(tmp_path):
         yield app, client, github, task_id, action_id
 
 
-def preview(case):
+def preview(case, expected=PAYLOAD):
     _, client, _, task_id, _ = case
     result = client.get(f"/api/tasks/{task_id}/review-recovery")
     assert result.status_code == 200, result.text
     data = result.json()
-    assert data["request"] == PAYLOAD
+    assert data["request"] == expected
     return {key: data[key] for key in ("action_id", "attempts", "head_sha", "payload_sha256")} | {"reason": "Owner authorized the scoped acceptance recovery."}
 
 
@@ -97,6 +120,21 @@ def state(case):
     app, _, _, task_id, action_id = case
     with app.state.sessions() as db:
         return db.get(Task, task_id).status, db.get(Outbox, action_id).status, db.get(Outbox, action_id).attempts
+
+
+def original_verdict(case):
+    app, _, _, task_id, action_id = case
+    with app.state.sessions.begin() as db:
+        action = db.get(Outbox, action_id)
+        db.add(Timeline(task_id=task_id, kind="pr_review_completed", timestamp=action.created - 1,
+            data={"head_sha": HEAD, "verdict": "approved", "blocking_issues": [], "suggestions": [],
+                  "summary": PAYLOAD["body"], "risk": "low", "previous_blocking_count": 0}))
+
+
+def no_second_verdict(case):
+    async def fail(*args, **kwargs):
+        raise AssertionError("An interrupted review must not ask an Agent to regenerate the published request")
+    case[0].state.processor.structured_agent = fail
 
 
 def write(case, payload=PAYLOAD):
@@ -114,6 +152,80 @@ def test_reconciles_existing_review_without_post(case):
     assert case[2].writes == []
 
 
+def test_reconciled_review_completes_real_task_without_another_post(case):
+    original_verdict(case)
+    no_second_verdict(case)
+    case[2].rows = [case[2].published()]
+    assert recover(case, preview(case)).status_code == 200
+    case[1].portal.call(case[0].state.processor.process, case[3])
+    assert state(case) == ("reviewed", "completed", 1)
+    assert case[2].writes == []
+    with case[0].state.sessions() as db:
+        task = db.get(Task, case[3])
+        assert task.data["review_url"].endswith("-42")
+        assert db.scalar(select(Timeline).where(Timeline.task_id == case[3], Timeline.kind == "pr_review_resumed"))
+
+
+def test_reconciled_changes_request_restores_findings_and_waiting_state(case):
+    app, client, github, task_id, action_id = case
+    summary = "Multiplication still has a blocking defect."
+    body = summary + "\n\n[blocking] src/calculator.js: multiply returns addition"
+    request = {**PAYLOAD, "event": "REQUEST_CHANGES", "body": body}
+    with app.state.sessions.begin() as db:
+        action = db.get(Outbox, action_id)
+        action.action_key = f"pr-review:owner/repo:5:{HEAD}:REQUEST_CHANGES"
+        action.data = {"head_sha": HEAD, "event": "REQUEST_CHANGES", "review_request": request}
+        db.add(Timeline(task_id=task_id, kind="pr_review_completed", timestamp=action.created - 1,
+            data={"head_sha": HEAD, "verdict": "changes_required", "risk": "medium", "summary": summary,
+                  "blocking_issues": [{"severity": "blocking", "path": "src/calculator.js",
+                                       "message": "multiply returns addition", "issue_type": "logic"}], "suggestions": []}))
+    github.rows = [github.published(state="CHANGES_REQUESTED", body=body)]
+    no_second_verdict(case)
+    assert recover(case, preview(case, request)).status_code == 200
+    client.portal.call(app.state.processor.process, task_id)
+    assert state(case) == ("waiting_for_contributor", "completed", 1)
+    assert github.writes == []
+    with app.state.sessions() as db:
+        finding = db.scalar(select(ReviewFinding).where(ReviewFinding.task_id == task_id))
+        assert finding.data["message"] == "multiply returns addition"
+
+
+def test_reconciled_review_rejects_different_event_for_same_task_and_head(case):
+    case[2].rows = [case[2].published()]
+    assert recover(case, preview(case)).status_code == 200
+    other = {**PAYLOAD, "event": "COMMENT", "body": "A new model verdict"}
+    with pytest.raises(RecoveryConflict):
+        case[1].portal.call(case[0].state.processor.github_action, case[3], "pr_review",
+            f"pr-review:owner/repo:5:{HEAD}:COMMENT",
+            {"head_sha": HEAD, "event": "COMMENT", "review_request": other}, case[2].publish)
+    assert case[2].writes == []
+
+
+def test_reconciled_review_waits_if_current_policy_now_requires_owner(case):
+    original_verdict(case)
+    no_second_verdict(case)
+    case[2].rows = [case[2].published()]
+    assert recover(case, preview(case)).status_code == 200
+    case[2].title = "Add new feature to calculator API"
+    case[1].portal.call(case[0].state.processor.process, case[3])
+    assert state(case) == ("waiting_for_owner", "completed", 1)
+    assert case[2].writes == []
+
+
+def test_completed_review_does_not_block_a_new_pr_head(case):
+    app, client, github, task_id, _ = case
+    github.rows = [github.published()]
+    assert recover(case, preview(case)).status_code == 200
+    new_head = "b" * 40
+    async def next_write():
+        return {"id": 43, "html_url": "https://github.com/owner/repo/pull/5#pullrequestreview-43"}
+    data = {"head_sha": new_head, "event": "APPROVE", "review_request":
+            {"commit_id": new_head, "event": "APPROVE", "body": "New head reviewed", "comments": []}}
+    result = client.portal.call(app.state.processor.github_action, task_id, "pr_review",
+        f"pr-review:owner/repo:5:{new_head}:APPROVE", data, next_write)
+    assert result["id"] == 43
+
+
 def test_explicit_retry_preserves_payload_and_only_publishes_once(case):
     decision = preview(case)
     assert recover(case, decision).status_code == 409
@@ -128,6 +240,52 @@ def test_explicit_retry_preserves_payload_and_only_publishes_once(case):
         row = db.get(Outbox, case[4])
         assert row.data["review_request"] == PAYLOAD
         assert db.scalar(select(Timeline).where(Timeline.kind == "github_review_retry_authorized"))
+
+
+def test_authorized_retry_uses_original_request_in_real_task(case):
+    original_verdict(case)
+    no_second_verdict(case)
+    assert recover(case, {**preview(case), "retry_authorized": True}).status_code == 200
+    case[1].portal.call(case[0].state.processor.process, case[3])
+    assert state(case) == ("reviewed", "completed", 2)
+    assert case[2].writes == [PAYLOAD]
+    case[1].portal.call(case[0].state.processor.process, case[3])
+    assert case[2].writes == [PAYLOAD]
+
+
+def test_cancelled_review_post_becomes_unknown_and_can_reconcile_online(case):
+    app, client, github, task_id, action_id = case
+    original_verdict(case)
+    with app.state.sessions.begin() as db:
+        db.get(Task, task_id).status = "queued"
+        action = db.get(Outbox, action_id)
+        action.status, action.attempts = "pending", 0
+    async def verdict(*args, **kwargs):
+        return ReviewVerdict(verdict="approved", summary=PAYLOAD["body"], risk="low")
+    app.state.processor.structured_agent = verdict
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def pause():
+            entered.set()
+            await release.wait()
+        github.review_pause = pause
+        run = asyncio.create_task(app.state.processor.process(task_id))
+        await entered.wait()
+        assert state(case) == ("running", "executing", 1)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+    client.portal.call(scenario)
+    assert state(case) == ("interrupted", "unknown", 1)
+    assert client.post(f"/api/tasks/{task_id}/retry").status_code == 409
+    github.review_pause = None
+    github.rows = [github.published()]
+    assert recover(case, preview(case)).status_code == 200
+    no_second_verdict(case)
+    client.portal.call(app.state.processor.process, task_id)
+    assert state(case) == ("reviewed", "completed", 1)
+    assert github.writes == []
 
 
 def test_late_success_is_found_before_retry(case):
