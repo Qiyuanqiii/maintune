@@ -7,8 +7,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PLUGIN = ["manifest.yaml", "src/web_review.py", "README.md", "LICENSE"]
-GATEWAY = ["gateway.py", "setup_gateway.py", "locales/zh-CN.json", "Start Gateway.cmd", "Start Gateway.command", "README.md", "LICENSE"]
+PLUGIN = ["manifest.yaml", "src/web_review.py", "README.md", "USER_GUIDE.zh-CN.md", "LICENSE"]
+GATEWAY = ["gateway.py", "setup_gateway.py", "locales/zh-CN.json", "Start Gateway.cmd", "Start Gateway.command", "README.md", "USER_GUIDE.zh-CN.md", "LICENSE"]
 
 
 def archive(path, files):

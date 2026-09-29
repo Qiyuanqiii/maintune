@@ -4,6 +4,8 @@
 
 插件 ID 为 `nanaseinori.mcp-review`。它是可独立打包的示例，包含无第三方依赖的 Python 网关。需要 Python 3.12+、已配置的 Maintune Preview 3 和 GitHub App。它不是包含 Maintune 的一键安装器，也不是浏览器扩展。
 
+首次使用请按 [中文使用手册](USER_GUIDE.zh-CN.md) 操作：从下载构建、插件安装、三个地址的填写，到首次只读检查、发布确认和故障排查。手册也包含在 `.mtp` 和网关 ZIP 中。Maintune 内置 README 阅读器只提供 README 页面，请从解压目录打开 `USER_GUIDE.zh-CN.md`，或查看 [PR 分支上的在线手册](https://github.com/Qiyuanqiii/maintune/blob/codex/web-review-mcp-plugin/examples/plugins/mcp-review/USER_GUIDE.zh-CN.md)。
+
 ## 宿主依赖与范围
 
 - 大于 64 KiB 的合法插件响应需要 [IPC 缓冲修复](https://github.com/mcxianyujun/maintune/pull/7)。真实 PR 的 CI 元数据也可能使响应超过此值。
