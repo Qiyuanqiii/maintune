@@ -213,6 +213,8 @@ class TaskProcessor:
                         self.event(db, task_id, "pr_review_context_persisted", {**context,
                             "repository": task.repository, "number": task.number, "action_key": action_key})
                     if reused:
+                        task.data = {**task.data, "review_reused_from": {
+                            "action_id": reused["action_id"], "head_sha": head_sha, "attempt": task.attempts}}
                         self.event(db, task_id, "pr_review_reused", {"action_id": reused["action_id"],
                             "origin_task_id": reused["task_id"], "head_sha": head_sha, "request_sha256": request_sha256})
             if blocked:
@@ -312,11 +314,20 @@ class TaskProcessor:
             raise RuntimeError("Selected plugin is not a Sandbox provider")
         return PluginSandbox(self.plugins, registration.identifier)
 
+    @staticmethod
+    def reused_review_completion(task: Task, status: str, head_sha: str | None = None) -> bool:
+        reuse = task.data.get("review_reused_from") or {}
+        return (task.kind == "pull_request" and status in {"reviewed", "waiting_for_contributor"}
+                and reuse.get("head_sha") == (head_sha or task.data.get("head_sha"))
+                and reuse.get("attempt") == task.attempts)
+
     def change_status(self, task_id: str, status: str, **data):
         task_kind = ""
+        reused_completion = False
         with self.sessions.begin() as db:
             task = db.get(Task, task_id)
             task_kind = task.kind
+            reused_completion = self.reused_review_completion(task, status, data.get("head_sha"))
             if status.startswith("failed_"):
                 failure = {
                     "stage": data.pop("failure_stage", status.removeprefix("failed_")),
@@ -330,6 +341,9 @@ class TaskProcessor:
             task.status, task.lease_until = status, None
             task.data = {**task.data, **data}
             self.event(db, task_id, "status_changed", {"status": status})
+            if reused_completion:
+                self.event(db, task_id, "review_completion_side_effects_skipped", {
+                    "action_id": task.data["review_reused_from"]["action_id"], "head_sha": task.data["head_sha"]})
         event = {
             "waiting_for_owner": "task.waiting_for_owner",
             "completed": "task.completed",
@@ -342,7 +356,7 @@ class TaskProcessor:
             event = "pr.changes_requested"
         elif task_kind == "pull_request" and status == "reviewed":
             event = "pr.reviewed"
-        if event:
+        if event and not reused_completion:
             self.emit_plugin_event(event, task_id, {"status": status})
 
     async def process(self, task_id: str):
@@ -410,12 +424,13 @@ class TaskProcessor:
             with self.sessions() as db:
                 final = db.get(Task, task_id)
                 status, summary = final.status, final.data.get("summary", final.data.get("error", ""))
-            if self.plugins:
+                reused_completion = self.reused_review_completion(final, status)
+            if self.plugins and not reused_completion:
                 try:
                     await self.plugins.finalize_task(task_id)
                 except Exception:
                     logger.exception("Task %s plugin finalizer dispatch failed", task_id)
-            if status not in {"queued", "running"}:
+            if status not in {"queued", "running"} and not reused_completion:
                 await self.notify(task_id, "report", f"Maintune · {repo_name} #{number}: {status}", f"Repository: {repo_name}\nTask: {kind} #{number}\nStatus: {status}\nSummary: {summary}\nGitHub: https://github.com/{repo_name}/{ 'issues' if kind == 'issue' else 'pull' }/{number}")
 
     async def process_issue(self, task_id, github, installation_id, repo, number, repository):

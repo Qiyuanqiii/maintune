@@ -246,6 +246,89 @@ def test_completed_review_is_reused_by_equivalent_new_webhook_task(case):
     assert github.writes == []
 
 
+def test_completed_review_reuse_completes_new_task_without_completion_side_effects(case):
+    app, client, github, original_id, action_id = case
+    processor = app.state.processor
+    events, finalizers, notifications = [], [], []
+
+    async def event_sink(event, task_id, data):
+        events.append((event, task_id))
+
+    async def finalizer(task_id):
+        finalizers.append(task_id)
+
+    async def notify(task_id, kind, subject, body):
+        notifications.append((task_id, kind))
+
+    async def verdict(*args, **kwargs):
+        return ReviewVerdict(verdict="approved", summary=PAYLOAD["body"], risk="low")
+
+    processor.event_sink = event_sink
+    processor.plugins.finalize_task = finalizer
+    processor.notify = notify
+    processor.structured_agent = verdict
+    with app.state.sessions.begin() as db:
+        db.delete(db.get(Outbox, action_id))
+        db.get(Task, original_id).status = "queued"
+
+    async def run_original():
+        await processor.process(original_id)
+        await asyncio.sleep(0)
+
+    client.portal.call(run_original)
+    assert github.writes == [PAYLOAD]
+    assert events.count(("pr.reviewed", original_id)) == 1
+    assert finalizers == [original_id]
+    assert notifications == [(original_id, "report")]
+    with app.state.sessions() as db:
+        published_action_id = db.scalar(select(Outbox.id).where(Outbox.task_id == original_id))
+
+    reused_id = webhook_task(case, "second-completed-review")
+
+    async def run_reused():
+        await processor.process(reused_id)
+        await asyncio.sleep(0)
+
+    client.portal.call(run_reused)
+    with app.state.sessions() as db:
+        assert db.get(Task, original_id).status == "reviewed"
+        second = db.get(Task, reused_id)
+        assert second.status == "reviewed"
+        assert second.data["review_url"].endswith("-42")
+        assert second.data["review_reused_from"]["action_id"] == published_action_id
+        assert db.scalar(select(Timeline).where(Timeline.task_id == reused_id,
+            Timeline.kind == "review_completion_side_effects_skipped"))
+        assert len(list(db.scalars(select(Outbox).where(Outbox.kind == "pr_review")))) == 1
+    assert github.writes == [PAYLOAD]
+    assert events.count(("pr.reviewed", reused_id)) == 0
+    assert events.count(("pr.reviewed", original_id)) == 1
+    assert finalizers == [original_id]
+    assert notifications == [(original_id, "report")]
+
+
+@pytest.mark.parametrize("marker_head,marker_attempt", [(HEAD, 1), ("b" * 40, 2)])
+def test_old_reuse_marker_does_not_suppress_independent_completion(case, marker_head, marker_attempt):
+    app, client, _, task_id, _ = case
+    events = []
+
+    async def event_sink(event, event_task_id, data):
+        events.append((event, event_task_id))
+
+    app.state.processor.event_sink = event_sink
+    with app.state.sessions.begin() as db:
+        task = db.get(Task, task_id)
+        task.attempts = 2
+        task.data = {**task.data, "review_reused_from": {
+            "action_id": "previous-action", "head_sha": marker_head, "attempt": marker_attempt}}
+
+    async def complete():
+        app.state.processor.change_status(task_id, "reviewed", head_sha=HEAD)
+        await asyncio.sleep(0)
+
+    client.portal.call(complete)
+    assert events == [("pr.reviewed", task_id)]
+
+
 def test_reconciles_existing_review_without_post(case):
     case[2].rows = [case[2].published()]
     result = recover(case, preview(case))
