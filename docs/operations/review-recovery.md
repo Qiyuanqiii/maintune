@@ -20,11 +20,13 @@ POST 会重新读取 GitHub，不能仅凭旧 GET 结果决策。若预览失效
 
 恢复以数据库条件更新领取动作。检查失败或取消会归还 `unknown`；Review POST 期间任务取消也会立即把 `executing` 标记为 `unknown`，允许在线对账，但普通任务 retry 仍被阻止。Core 重启会将遗留的 `executing/reconciling` 还原为 `unknown`。写入前保存原请求和尝试时间，防止并发 worker 重复领取。管理员决策记录为 `github_review_reconciled` 或 `github_review_retry_authorized`，包含动作、head、请求摘要和原因。
 
-执行重试前再次查询，可发现旧请求延迟产生的 Review。恢复任务会重新读取当前 PR 与仓库策略，核对原 verdict 和原请求，再从 Review 写入检查点完成 Task；不重跑 Reviewer、也不为同一 Task/head 的另一事件创建 Review。PR head 或仓库权限变化会阻止旧请求继续执行；新 head 仍可走正常的独立再审流程。
+执行重试前再次查询，可发现旧请求延迟产生的 Review。恢复任务会重新读取当前 PR 与仓库策略，核对原 verdict 和原请求，再从 Review 写入检查点完成 Task；不重跑 Reviewer。PR head 或仓库权限变化会阻止旧请求继续执行；新 head 仍可走正常的独立再审流程。
+
+新 Review 写入在请求发出前，将仓库、PR 编号、head SHA、Review 事件、完整请求及其 SHA-256 摘要保存到 Task/Outbox。新 Outbox 的唯一键按仓库、PR 编号和 head SHA 建立。同一 head 的后续 Webhook Task 会检查所有既有 Review 动作：相同请求且已完成时复用原结果；未知、执行中、等待管理员对账或内容不同的动作会阻止新写入，并在新 Task 时间线记录原动作 ID。未知动作仍须通过原 Task 的管理员恢复接口处理，不会由新 Task 自动重试或绕过授权。旧版带事件后缀的动作键继续可读取和恢复。
 
 **GitHub API 没有本实现使用的原子幂等键。** 等待两分钟和再次查询不能排除“最后一次查询之后，旧请求才完成”的竞态。查不到不是失败证明，因此需要明确的单次重试授权，不能声称跨网络绝对恰好一次。新的失败仍变成 `unknown`，不会自动反复发布。
 
-旧 Preview 3 只保存 head 和事件。只有审计足以重建无 findings、无附加正文的 APPROVE 时，才支持恢复旧动作；旧行内评论或含 CI 附加文案的请求拒绝推测。新动作直接保存完整请求。无新增表或列，使用既有 JSON 与 Timeline。
+旧 Preview 3 只保存 head 和事件。只有审计足以重建无 findings、无附加正文的 APPROVE 时，才支持恢复旧动作；旧行内评论或含 CI 附加文案的请求拒绝推测。旧动作若保存了原请求但 Task 缺少 head，可按 Outbox 中不可变的 head、事件和请求进行保守对账，并再次核对 GitHub 当前 head；新动作缺少 Task head 则拒绝恢复。无新增表或列，使用既有 JSON 与 Timeline。
 
 ## 验证范围
 

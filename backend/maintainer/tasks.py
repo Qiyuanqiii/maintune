@@ -15,7 +15,7 @@ from .notifications import EmailNotifier
 from .policy import MergeEvidence, issue_triage_gate, merge_blockers, owner_action, pull_triage_gate
 from .providers import OpenAICompatible, openai_compatible_parameters
 from .runtime import AgentHardLimitReached, AgentLoopDetected, AgentStepLimitReached, AgentTaskTimeout, ModelRequestTimeout, OpenHandsRuntime, ToolCallTimeout, agent_task, structured_call, tool_call
-from .review_recovery import RecoveryConflict, inspect_remote
+from .review_recovery import RecoveryConflict, inspect_remote, payload_hash
 from .sandboxes import LocalSandbox, PluginSandbox, ShipyardSandbox
 from .schemas import IssueAnalysis, ReviewVerdict
 
@@ -159,12 +159,66 @@ class TaskProcessor:
 
     async def github_action(self, task_id: str, kind: str, action_key: str, data: dict, perform):
         if kind == "pr_review":
-            with self.sessions() as db:
-                previous = list(db.scalars(select(Outbox).where(Outbox.task_id == task_id, Outbox.kind == kind)))
-                if any(item.action_key != action_key and (item.status in {"unknown", "executing", "reconciling"}
-                       or (item.status == "completed" and item.data.get("head_sha") == data.get("head_sha"))
-                       or (item.status == "pending" and item.data.get("recovery"))) for item in previous):
-                    raise RecoveryConflict("A previous review action requires reconciliation")
+            request = data.get("review_request") or {}
+            head_sha, event = data.get("head_sha"), data.get("event")
+            if (not isinstance(request, dict) or request.get("commit_id") != head_sha
+                    or request.get("event") != event or event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}):
+                raise RecoveryConflict("Review request identity is inconsistent")
+            request_sha256 = payload_hash(request)
+            blocked = reused = None
+            with self.sessions.begin() as db:
+                task = db.get(Task, task_id)
+                if not task or task.kind != "pull_request":
+                    raise RecoveryConflict("A pull request task is required for review writes")
+                scope_key = f"pr-review:{task.repository}:{task.number}:{head_sha}"
+                legacy_key = f"{scope_key}:{event}"
+                if action_key not in {scope_key, legacy_key}:
+                    raise RecoveryConflict("Review action identity is inconsistent")
+                if action_key == legacy_key and not db.scalar(select(Outbox).where(Outbox.action_key == legacy_key)):
+                    raise RecoveryConflict("New review actions require the shared PR/head identity")
+                repository = db.get(Repository, task.repository)
+                installation_id = data.get("installation_id") or task.data.get("installation_id") or (repository.installation_id if repository else None)
+                if not installation_id:
+                    raise RecoveryConflict("Review installation is unavailable")
+                if task.data.get("installation_id") and task.data["installation_id"] != installation_id:
+                    raise RecoveryConflict("Review installation changed")
+                data = {**data, "repository": task.repository, "number": task.number,
+                        "installation_id": installation_id, "request_sha256": request_sha256}
+                context = {"installation_id": installation_id, "head_sha": head_sha,
+                           "review_event": event, "review_request_sha256": request_sha256}
+                previous = list(db.execute(select(Outbox, Task).join(Task, Outbox.task_id == Task.id).where(
+                    Outbox.kind == "pr_review", Task.kind == "pull_request",
+                    Task.repository == task.repository, Task.number == task.number)))
+                for item, owner in previous:
+                    if item.data.get("head_sha") != head_sha:
+                        continue
+                    original_request = item.data.get("review_request")
+                    original_installation = item.data.get("installation_id") or owner.data.get("installation_id")
+                    same_request = (original_request == request and item.data.get("event") == event
+                                    and original_installation == installation_id
+                                    and (not item.data.get("request_sha256") or item.data["request_sha256"] == request_sha256))
+                    if item.task_id == task_id and item.action_key == action_key and same_request:
+                        continue
+                    if item.status == "completed" and same_request and item.external_url:
+                        reused = {"id": item.external_id, "html_url": item.external_url, "action_id": item.id,
+                                  "task_id": owner.id}
+                        continue
+                    blocked = {"action_id": item.id, "task_id": owner.id, "status": item.status, "head_sha": head_sha}
+                    break
+                if blocked:
+                    self.event(db, task_id, "pr_review_blocked_existing_action", blocked)
+                else:
+                    if any(task.data.get(key) != value for key, value in context.items()):
+                        task.data = {**task.data, **context}
+                        self.event(db, task_id, "pr_review_context_persisted", {**context,
+                            "repository": task.repository, "number": task.number, "action_key": action_key})
+                    if reused:
+                        self.event(db, task_id, "pr_review_reused", {"action_id": reused["action_id"],
+                            "origin_task_id": reused["task_id"], "head_sha": head_sha, "request_sha256": request_sha256})
+            if blocked:
+                raise RecoveryConflict("A review for this PR head already exists or requires reconciliation")
+            if reused:
+                return {"id": reused["id"], "html_url": reused["html_url"]}
         row = self.reserve(task_id, kind, action_key, data)
         if kind == "pr_review" and row.data.get("review_request") and row.data["review_request"] != data.get("review_request"):
             raise RecoveryConflict("Reserved review content changed; do not replay it")
@@ -581,7 +635,12 @@ class TaskProcessor:
             request = action.data.get("review_request")
             if (not request or request.get("commit_id") != head_sha or action.data.get("head_sha") != head_sha
                     or request.get("event") not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}
-                    or action.action_key != f"pr-review:{repo}:{number}:{head_sha}:{request['event']}"
+                    or action.action_key not in {f"pr-review:{repo}:{number}:{head_sha}",
+                                                 f"pr-review:{repo}:{number}:{head_sha}:{request['event']}"}
+                    or (action.data.get("request_sha256") and action.data["request_sha256"] != payload_hash(request))
+                    or (action.data.get("repository") and action.data["repository"] != repo)
+                    or (action.data.get("number") and action.data["number"] != number)
+                    or (action.data.get("installation_id") and action.data["installation_id"] != installation_id)
                     or pull.get("state") != "open" or pull.get("merged") or pull.get("draft")
                     or not repository.get("enabled") or not repository.get("auto_review_prs")):
                 raise RecoveryConflict("Saved review no longer matches the current PR or repository policy")
@@ -781,7 +840,7 @@ class TaskProcessor:
             event = "COMMENT"
             body_lines.append("Approval held because CI failed.")
         request = {"commit_id": head_sha, "event": event, "body": "\n\n".join(body_lines), "comments": comments}
-        review = await self.at_stage("github_review", self.github_action(task_id, "pr_review", f"pr-review:{repo}:{number}:{head_sha}:{event}", {"head_sha": head_sha, "event": event, "review_request": request}, lambda: github.review(installation_id, repo, number, head_sha, event, request["body"], comments)))
+        review = await self.at_stage("github_review", self.github_action(task_id, "pr_review", f"pr-review:{repo}:{number}:{head_sha}", {"head_sha": head_sha, "event": event, "review_request": request, "installation_id": installation_id}, lambda: github.review(installation_id, repo, number, head_sha, event, request["body"], comments)))
         with self.sessions.begin() as db:
             for fingerprint, finding in new_findings:
                 db.add(ReviewFinding(task_id=task_id, repository=repo, number=number, fingerprint=fingerprint, head_sha=head_sha, data=finding.model_dump()))

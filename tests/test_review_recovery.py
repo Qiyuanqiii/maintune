@@ -12,8 +12,8 @@ from sqlalchemy import select
 
 from maintainer.api import create_app
 from maintainer.db import Outbox, Repository, ReviewFinding, Task, Timeline
-from maintainer.github import GitHubAppClient, GitHubError
-from maintainer.review_recovery import RecoveryConflict, RecoveryDecision, recover_review
+from maintainer.github import GitHubAppClient, GitHubError, ingest_webhook
+from maintainer.review_recovery import RecoveryConflict, RecoveryDecision, recover_review, payload_hash
 from maintainer.schemas import ReviewVerdict
 from maintainer.security import Settings
 
@@ -143,6 +143,109 @@ def write(case, payload=PAYLOAD):
                               {"head_sha": HEAD, "event": "APPROVE", "review_request": payload}, github.publish)
 
 
+def webhook_task(case, delivery_id):
+    app = case[0]
+    payload = {"action": "opened", "repository": {"full_name": "owner/repo"},
+               "pull_request": {"number": 5}, "installation": {"id": 7}}
+    with app.state.sessions.begin() as db:
+        _, task, _ = ingest_webhook(db, delivery_id, "pull_request", b"new delivery", payload)
+        assert "head_sha" not in task.data
+        return task.id
+
+
+def test_first_review_write_persists_recovery_context_for_webhook_task(case):
+    app, client, github, _, _ = case
+    task_id = webhook_task(case, "no-prefilled-head")
+    new_head = "b" * 40
+    request = {**PAYLOAD, "commit_id": new_head}
+    async def uncertain_write():
+        raise TimeoutError("GitHub response lost")
+    with pytest.raises(TimeoutError):
+        client.portal.call(app.state.processor.github_action, task_id, "pr_review",
+            f"pr-review:owner/repo:5:{new_head}",
+            {"head_sha": new_head, "event": "APPROVE", "review_request": request}, uncertain_write)
+    with app.state.sessions.begin() as db:
+        task = db.get(Task, task_id)
+        task.status = "failed_environment"
+        assert task.data["head_sha"] == new_head
+        assert task.data["review_event"] == "APPROVE"
+        assert task.data["review_request_sha256"] == payload_hash(request)
+        row = db.scalar(select(Outbox).where(Outbox.task_id == task_id))
+        assert row.status == "unknown"
+        assert {key: row.data[key] for key in ("repository", "number", "installation_id", "request_sha256")} == {
+            "repository": "owner/repo", "number": 5, "installation_id": 7,
+            "request_sha256": payload_hash(request)}
+    github.head = new_head
+    result = client.get(f"/api/tasks/{task_id}/review-recovery")
+    assert result.status_code == 200, result.text
+    assert result.json()["request"] == request
+    github.rows = [github.published(commit_id=new_head)]
+    decision = {key: result.json()[key] for key in ("action_id", "attempts", "head_sha", "payload_sha256")}
+    reconciled = client.post(f"/api/tasks/{task_id}/review-recovery",
+        json={**decision, "reason": "Owner reconciled the original review on its saved head."})
+    assert reconciled.status_code == 200, reconciled.text
+    assert reconciled.json()["outcome"] == "reconciled"
+    assert github.writes == []
+
+
+def test_new_review_recovery_rejects_changed_task_context(case):
+    app, client, github, _, _ = case
+    task_id = webhook_task(case, "immutable-context")
+    new_head = "b" * 40
+    request = {**PAYLOAD, "commit_id": new_head}
+    async def uncertain_write():
+        raise TimeoutError("GitHub response lost")
+    with pytest.raises(TimeoutError):
+        client.portal.call(app.state.processor.github_action, task_id, "pr_review",
+            f"pr-review:owner/repo:5:{new_head}",
+            {"head_sha": new_head, "event": "APPROVE", "review_request": request}, uncertain_write)
+    github.head = new_head
+    with app.state.sessions.begin() as db:
+        task = db.get(Task, task_id)
+        task.status = "failed_environment"
+        task.data = {**task.data, "review_event": "COMMENT"}
+    assert client.get(f"/api/tasks/{task_id}/review-recovery").status_code == 409
+    assert github.writes == []
+
+
+@pytest.mark.parametrize("event", ["APPROVE", "COMMENT"])
+def test_unknown_review_blocks_equivalent_new_webhook_task(case, event):
+    app, client, github, _, action_id = case
+    task_id = webhook_task(case, f"duplicate-{event}")
+    request = {**PAYLOAD, "event": event}
+    async def forbidden_write():
+        raise AssertionError("second GitHub review was sent")
+    with pytest.raises(RecoveryConflict):
+        client.portal.call(app.state.processor.github_action, task_id, "pr_review",
+            f"pr-review:owner/repo:5:{HEAD}",
+            {"head_sha": HEAD, "event": event, "review_request": request}, forbidden_write)
+    with app.state.sessions() as db:
+        assert list(db.scalars(select(Outbox).where(Outbox.task_id == task_id))) == []
+        blocked = db.scalar(select(Timeline).where(Timeline.task_id == task_id,
+            Timeline.kind == "pr_review_blocked_existing_action"))
+        assert blocked.data["action_id"] == action_id
+    assert github.writes == []
+
+
+def test_completed_review_is_reused_by_equivalent_new_webhook_task(case):
+    app, client, github, _, action_id = case
+    with app.state.sessions.begin() as db:
+        row = db.get(Outbox, action_id)
+        row.status, row.external_id, row.external_url = "completed", "42", github.published()["html_url"]
+    task_id = webhook_task(case, "equivalent-completed")
+    async def forbidden_write():
+        raise AssertionError("second GitHub review was sent")
+    result = client.portal.call(app.state.processor.github_action, task_id, "pr_review",
+        f"pr-review:owner/repo:5:{HEAD}",
+        {"head_sha": HEAD, "event": "APPROVE", "review_request": PAYLOAD}, forbidden_write)
+    assert result["html_url"] == github.published()["html_url"]
+    with app.state.sessions() as db:
+        assert db.scalar(select(Timeline).where(Timeline.task_id == task_id,
+            Timeline.kind == "pr_review_reused"))
+        assert list(db.scalars(select(Outbox).where(Outbox.task_id == task_id))) == []
+    assert github.writes == []
+
+
 def test_reconciles_existing_review_without_post(case):
     case[2].rows = [case[2].published()]
     result = recover(case, preview(case))
@@ -222,7 +325,7 @@ def test_completed_review_does_not_block_a_new_pr_head(case):
     data = {"head_sha": new_head, "event": "APPROVE", "review_request":
             {"commit_id": new_head, "event": "APPROVE", "body": "New head reviewed", "comments": []}}
     result = client.portal.call(app.state.processor.github_action, task_id, "pr_review",
-        f"pr-review:owner/repo:5:{new_head}:APPROVE", data, next_write)
+        f"pr-review:owner/repo:5:{new_head}", data, next_write)
     assert result["id"] == 43
 
 
@@ -389,6 +492,10 @@ def test_changed_payload_cannot_use_retry_authorization(case):
         write(case, {**PAYLOAD, "body": "Changed after approval"})
     assert state(case)[1:] == ("pending", 1)
     assert case[2].writes == []
+    with case[0].state.sessions() as db:
+        task = db.get(Task, case[3])
+        assert task.data["review_request_sha256"] == payload_hash(PAYLOAD)
+        assert task.data["review_event"] == "APPROVE"
 
 
 def test_two_workers_cannot_send_two_posts(case):

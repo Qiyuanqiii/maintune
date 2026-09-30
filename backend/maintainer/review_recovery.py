@@ -57,19 +57,28 @@ def snapshot(sessions, task_id):
                     or review.get("head_sha") != action.data.get("head_sha") or not review.get("summary")):
                 raise RecoveryConflict("Original review payload is unavailable; do not infer or replay it")
             payload = {"commit_id": action.data["head_sha"], "event": "APPROVE", "body": review["summary"], "comments": []}
+        task_head = task.data.get("head_sha")
+        request_sha256 = payload_hash(payload)
         if (set(payload) != {"commit_id", "event", "body", "comments"}
                 or payload["commit_id"] != action.data.get("head_sha")
                 or payload["event"] != action.data.get("event")
                 or payload["event"] not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}
                 or not isinstance(payload["body"], str) or not isinstance(payload["comments"], list)
-                or task.data.get("head_sha") != payload["commit_id"]):
+                or (task_head and task_head != payload["commit_id"])
+                or (action.data.get("request_sha256") and (task_head != payload["commit_id"]
+                    or task.data.get("review_event") != payload["event"]
+                    or task.data.get("review_request_sha256") != request_sha256
+                    or action.data["request_sha256"] != request_sha256))
+                or (action.data.get("repository") and action.data["repository"] != task.repository)
+                or (action.data.get("number") and action.data["number"] != task.number)
+                or (action.data.get("installation_id") and action.data["installation_id"] != installation)):
             raise RecoveryConflict("Original review payload or task head is inconsistent")
-        expected_key = f"pr-review:{task.repository}:{task.number}:{payload['commit_id']}:{payload['event']}"
-        if action.action_key != expected_key:
+        scope_key = f"pr-review:{task.repository}:{task.number}:{payload['commit_id']}"
+        if action.action_key not in {scope_key, f"{scope_key}:{payload['event']}"}:
             raise RecoveryConflict("Review action identity is inconsistent")
         return {"action_id": action.id, "attempts": action.attempts, "task_id": task.id,
                 "repository": task.repository, "number": task.number, "installation": installation,
-                "head_sha": payload["commit_id"], "payload_sha256": payload_hash(payload),
+                "head_sha": payload["commit_id"], "payload_sha256": request_sha256,
                 "payload": payload, "data": dict(action.data),
                 "last_attempt": action.data.get("attempt_started_at", action.created)}
 
@@ -153,7 +162,8 @@ async def recover_review(processor, task_id, decision):
         with sessions.begin() as db:
             task = db.get(Task, task_id)
             repo = db.get(Repository, item["repository"])
-            if (not task or task.data.get("head_sha") != item["head_sha"]
+            if (not task or (task.data.get("head_sha") and task.data["head_sha"] != item["head_sha"])
+                    or (item["data"].get("request_sha256") and task.data.get("head_sha") != item["head_sha"])
                     or not (task.status.startswith("failed_") or task.status == "interrupted")
                     or (task.data.get("installation_id") or (repo.installation_id if repo else None)) != item["installation"]
                     or not repo or not repo.data.get("enabled", False) or not repo.data.get("auto_review_prs", False)
@@ -170,7 +180,9 @@ async def recover_review(processor, task_id, decision):
             if changed != 1:
                 raise RecoveryConflict("Recovery claim changed")
             task.status, task.lease_until = "queued", None
-            task.data = {key: value for key, value in task.data.items() if key not in {"error", "failure"}}
+            task.data = {key: value for key, value in task.data.items() if key not in {"error", "failure"}} | {
+                "head_sha": item["head_sha"], "review_event": item["payload"]["event"],
+                "review_request_sha256": item["payload_sha256"]}
             db.add(Timeline(task_id=task_id, kind="github_review_reconciled" if match else "github_review_retry_authorized",
                 data={"action_id": item["action_id"], "head_sha": item["head_sha"], "payload_sha256": item["payload_sha256"],
                       "reason": decision.reason, "source": "admin_api", "review_url": match["html_url"] if match else None}))
